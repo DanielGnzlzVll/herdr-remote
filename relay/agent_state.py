@@ -1,7 +1,7 @@
 """Shared relay agent snapshot and incremental-update helpers."""
 from typing import Optional
 
-AGENT_EVENT_FIELDS = ("pane_id", "agent", "status", "cwd", "project", "host")
+AGENT_EVENT_FIELDS = ("pane_id", "agent", "status", "cwd", "project", "host", "title", "branch")
 REQUIRED_AGENT_FIELDS = ("pane_id", "agent", "status", "cwd", "project")
 
 

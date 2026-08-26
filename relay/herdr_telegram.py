@@ -64,6 +64,44 @@ ACTION_CODES = {
     "approval": "k",
 }
 CODE_ACTIONS = {code: action for action, code in ACTION_CODES.items()}
+STATUS_GLYPH = {"blocked": "🔴", "working": "🟡", "done": "🟢", "idle": "🟢", "unknown": "⚪"}
+
+
+# --- Agent identity header ---
+
+def agent_by_pane(pane_id: str) -> dict:
+    return next((a for a in agents if a.get("pane_id") == pane_id), {})
+
+
+def format_agent_header(agent: dict, status: str | None = None) -> str:
+    """Two-line identity header so a message is attributable at a glance.
+
+    Line 1: <status glyph> <tab name>
+    Line 2: 📁 <directory>  ·  🔀 <branch>   (each part omitted when unknown)
+    """
+    st = status or agent.get("status", "unknown")
+    glyph = STATUS_GLYPH.get(st, "⚪")
+    title = agent.get("title") or agent.get("project") or agent.get("agent") or "agent"
+    bits = []
+    if agent.get("project"):
+        bits.append(f"📁 {agent['project']}")
+    if agent.get("branch"):
+        bits.append(f"🔀 {agent['branch']}")
+    header = f"{glyph} {title}"
+    if bits:
+        header += "\n" + "  ·  ".join(bits)
+    return header
+
+
+def with_header(pane_id: str, body: str, status: str | None = None) -> str:
+    """Prepend the agent identity header to a plain-text message body."""
+    return f"{format_agent_header(agent_by_pane(pane_id), status=status)}\n\n{body}"
+
+
+def _md_escape(s: str) -> str:
+    for ch in ("_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
 
 
 # --- Relay communication ---
@@ -125,8 +163,62 @@ async def send_keys_to_relay(pane_id: str, keys: list[str], prompt_id: str | Non
         await await_command_result(ws, request_id, "send_keys")
 
 
-async def read_pane(pane_id: str, lines: int = 15) -> str:
-    """Read pane content from relay."""
+def _is_tui_chrome(line: str) -> bool:
+    """True for terminal-UI decoration that is not part of the agent's message.
+
+    Covers the Claude Code TUI status bar, compaction / auto-mode / update
+    notices, the spinner, horizontal rules and the echo of the user's own
+    input — everything wrapped around the actual reply in a raw snapshot.
+    """
+    s = line.strip()
+    if not s:
+        return False
+    if set(s) <= set("─—-_"):                          # horizontal rules
+        return True
+    if s[0] in "❯✻✔✗✢✽✶✷✳✴✦✧✺❋❂✼":                    # prompt echo, spinners, update/notice ticks
+        return True
+    if s.startswith("⏵⏵") or s.startswith("💬"):        # auto-mode / compaction banner
+        return True
+    if "% of" in s and "tokens" in s and "|" in s:      # "…41% of 200k tokens…" status bar
+        return True
+    if s.startswith("💲") or "⏱" in s:                  # cost / elapsed-time footer
+        return True
+    low = s.lower()
+    if "auto-compact" in low or "to run in background" in low or "esc to interrupt" in low:
+        return True
+    if "tokens)" in s and ("↓" in s or "↑" in s):       # spinner progress "… (3m · ↓ 9.9k tokens)"
+        return True
+    return False
+
+
+def extract_last_message(content: str) -> str:
+    """Reduce a raw terminal snapshot to just the agent's last message.
+
+    herdr only exposes the raw TUI snapshot, so we parse it here. In the Claude
+    Code TUI each agent turn is a block prefixed with '●'; we keep the last such
+    block and strip the trailing chrome (status bar, compaction/auto-mode/update
+    notices, rules, and the user's echoed input). Falls back to the de-chromed
+    tail of the snapshot when no '●' marker is present (e.g. a non-Claude agent).
+    """
+    lines = content.replace("\r", "").split("\n")
+    markers = [i for i, ln in enumerate(lines) if ln.lstrip().startswith("●")]
+    block = lines[markers[-1]:] if markers else lines[:]
+    # Strip trailing chrome/blank lines only, so a ✔/✗ inside the message body
+    # (above the status area) is preserved.
+    while block and (not block[-1].strip() or _is_tui_chrome(block[-1])):
+        block.pop()
+    while block and not block[0].strip():
+        block.pop(0)
+    text = "\n".join(block).strip()
+    if text.startswith("● "):
+        text = text[2:]
+    elif text.startswith("●"):
+        text = text[1:].lstrip()
+    return text or "(no message)"
+
+
+async def read_pane(pane_id: str, lines: int = 120) -> str:
+    """Read pane content from relay, reduced to the agent's last message."""
     import websockets
     try:
         async with websockets.connect(RELAY_WS) as ws:
@@ -143,7 +235,7 @@ async def read_pane(pane_id: str, lines: int = 15) -> str:
                 raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
                 msg = json.loads(raw)
                 if msg.get("type") == "pane_content":
-                    return msg.get("content", "(empty)")
+                    return extract_last_message(msg.get("content", ""))
     except Exception as e:
         return f"(error reading pane: {scrub(e)})"
 
@@ -200,7 +292,7 @@ def clear_relay_connection_state():
 
 async def send_reply_prompt(message, chat, agent: dict, content: str | None = None):
     project = agent.get("project") or agent.get("agent") or "agent"
-    parts = [f"{project}:"]
+    parts = [format_agent_header(agent)]
     if content is not None:
         parts.extend(["", content])
     parts.extend(["", "Reply to this message to send your response."])
@@ -454,7 +546,7 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     content = await read_pane(match["pane_id"])
     if len(content) > 3500:
         content = content[-3500:]
-    msg = await update.message.reply_text(f"{match['project']}:\n\n{content}")
+    msg = await update.message.reply_text(with_header(match["pane_id"], content))
     register_pending(update.effective_chat.id, msg.message_id, match["pane_id"])
 
 
@@ -639,7 +731,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         content = await read_pane(data["pane_id"])
         if len(content) > 3500:
             content = content[-3500:]
-        msg = await query.message.reply_text(f"{content}")
+        msg = await query.message.reply_text(with_header(data["pane_id"], content))
         register_pending(update.effective_chat.id, msg.message_id, data["pane_id"])
         return
 
@@ -870,8 +962,9 @@ async def notify_blocked(
         if multi
         else "Use an approval button, open the output, or reply to this notification."
     )
+    header = _md_escape(format_agent_header(agent_by_pane(pane_id), status="blocked"))
     text = (
-        f"*{agent}* blocked in `{project}`\n\n```\n{prompt[:400]}\n```\n\n"
+        f"{header}\n\n*blocked*\n\n```\n{prompt[:400]}\n```\n\n"
         f"{instruction}"
     )
     generation = secrets.token_hex(4)
@@ -944,11 +1037,12 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
 
         if old_status and old_status != new_status and new_status in ("idle", "done") and old_status in ("working", "blocked"):
             try:
+                header = format_agent_header({**agent_by_pane(pane_id), **agent_data}, status=new_status)
                 msg = await app.bot.send_message(
                     chat_id=int(CHAT_ID),
                     text=(
-                        f"{agent_data['project']} ({agent_data['agent']}) finished.\n\n"
-                        "Open the output below, or reply to this notification to send a follow-up."
+                        f"{header}\n\n"
+                        "✅ finished. Open the output below, or reply to this notification to send a follow-up."
                     ),
                     reply_markup=interaction_keyboard(pane_id),
                 )

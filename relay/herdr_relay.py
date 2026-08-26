@@ -377,6 +377,42 @@ def _mutate_herdr(*args, remote=None):
         return False
 
 
+def clean_tab_title(title: str) -> str:
+    """Drop a leading herdr status glyph (e.g. '◑ ', '✳ ') from a tab title."""
+    title = (title or "").strip()
+    if title and not (title[0].isalnum() or title[0] in "\"'([<"):
+        title = title[1:].strip()
+    return title
+
+
+_branch_cache: dict[str, tuple[str, float]] = {}  # cwd -> (branch, timestamp)
+_BRANCH_TTL = 10  # seconds; poll runs every 2s, so this caps git calls per dir
+
+
+def git_branch(cwd: str, remote=None) -> str:
+    """Current git branch for cwd (local only), cached briefly. '' if none/detached."""
+    if remote or not cwd:
+        return ""
+    now = time.time()
+    hit = _branch_cache.get(cwd)
+    if hit and now - hit[1] < _BRANCH_TTL:
+        return hit[0]
+    branch = ""
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode == 0:
+            branch = out.stdout.strip()
+            if branch == "HEAD":  # detached HEAD
+                branch = ""
+    except Exception:
+        branch = ""
+    _branch_cache[cwd] = (branch, now)
+    return branch
+
+
 def get_workspace_labels(remote=None):
     """Map workspace_id to the workspace name the user chose in herdr."""
     raw = run_herdr("workspace", "list", remote=remote)
@@ -409,6 +445,8 @@ def get_agents_from_host(remote=None):
                 "status": p.get("agent_status", "unknown"),
                 "cwd": p.get("cwd", ""),
                 "project": os.path.basename(p.get("cwd", "")),
+                "title": clean_tab_title(p.get("terminal_title_stripped") or p.get("terminal_title") or ""),
+                "branch": git_branch(p.get("cwd", ""), remote),
                 "host": host_label,
                 "remote": remote,
                 "workspace_id": p.get("workspace_id", ""),
