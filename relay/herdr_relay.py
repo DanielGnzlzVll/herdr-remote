@@ -2964,6 +2964,18 @@ async def handle_client(ws):
             # look at it, whatever the rest of the message turns out to be.
             if msg_type in SEEN_ON:
                 activity_note_seen(msg.get("pane_id", ""))
+            if msg_type in ("question_toggle", "question_submit") and msg.get("request_id"):
+                # Only a caller that asked for an acknowledgement gets one; the web app never does.
+                request_id = msg["request_id"]
+
+                async def question_result(ok, command=msg_type):
+                    await ws.send(json.dumps({
+                        "type": "command_result", "command": command, "ok": bool(ok),
+                        "request_id": request_id,
+                    }))
+            else:
+                async def question_result(ok):
+                    pass
             if msg_type == "question_toggle":
                 pane_id = msg["pane_id"]
                 option = msg.get("option", "")
@@ -2980,6 +2992,7 @@ async def handle_client(ws):
 
                 if pane_id not in known_panes or not option:
                     await ws.send(toggle_error("invalid question option"))
+                    await question_result(False)
                     continue
                 remote = pane_remote_map.get(pane_id)
                 if not await asyncio.to_thread(
@@ -2987,10 +3000,13 @@ async def handle_client(ws):
                 ):
                     await ws.send(toggle_error("question changed; refresh and try again"))
                     await rebroadcast_blocked(pane_id, remote=remote)
+                    await question_result(False)
                     continue
-                if not await asyncio.to_thread(toggle_question_option, pane_id, option, remote=remote):
+                toggled = await asyncio.to_thread(toggle_question_option, pane_id, option, remote=remote)
+                if not toggled:
                     await ws.send(toggle_error("question option toggle failed"))
                 await rebroadcast_blocked(pane_id, remote=remote)
+                await question_result(toggled)
             elif msg_type == "question_submit":
                 pane_id = msg["pane_id"]
 
@@ -3002,6 +3018,7 @@ async def handle_client(ws):
 
                 if pane_id not in known_panes:
                     await ws.send(submit_error("unknown pane_id"))
+                    await question_result(False)
                     continue
                 remote = pane_remote_map.get(pane_id)
                 if not await asyncio.to_thread(
@@ -3009,10 +3026,13 @@ async def handle_client(ws):
                 ):
                     await ws.send(submit_error("question changed; refresh and try again"))
                     await rebroadcast_blocked(pane_id, remote=remote)
+                    await question_result(False)
                     continue
-                if not await asyncio.to_thread(submit_multi_question, pane_id, remote=remote):
+                submitted = await asyncio.to_thread(submit_multi_question, pane_id, remote=remote)
+                if not submitted:
                     await ws.send(submit_error("question submission failed"))
                     await rebroadcast_blocked(pane_id, remote=remote)
+                await question_result(submitted)
             elif msg_type == "respond":
                 pane_id = msg["pane_id"]
                 request_id = msg.get("request_id")

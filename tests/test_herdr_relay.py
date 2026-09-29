@@ -1747,6 +1747,52 @@ class RelayQuestionTests(unittest.TestCase):
             self.assertIn("prompt changed", json.loads(ws.sent[-1])["message"])
 
 
+class RelayQuestionAckTests(unittest.TestCase):
+    """question_toggle / question_submit acknowledge only callers that send a request_id."""
+
+    def _run(self, relay, message, toggled=True, submitted=True, matches=True):
+        ws = _FakeWebSocket([json.dumps(message)])
+        relay.known_panes.add("w1:p1")
+        with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+             mock.patch.object(relay, "prompt_matches", return_value=matches), \
+             mock.patch.object(relay, "toggle_question_option", return_value=toggled), \
+             mock.patch.object(relay, "submit_multi_question", return_value=submitted), \
+             mock.patch.object(relay, "rebroadcast_blocked", new=mock.AsyncMock()):
+            asyncio.run(relay.handle_client(ws))
+        return [json.loads(m) for m in ws.sent]
+
+    def _results(self, sent):
+        return [m for m in sent if m.get("type") == "command_result"]
+
+    def test_toggle_acknowledges_success_and_failure(self):
+        with loaded_relay() as relay:
+            ok = self._run(relay, {"type": "question_toggle", "pane_id": "w1:p1", "option": "A",
+                                   "prompt_id": "q", "request_id": "r1"})
+            failed = self._run(relay, {"type": "question_toggle", "pane_id": "w1:p1", "option": "A",
+                                       "prompt_id": "q", "request_id": "r2"}, toggled=False)
+        self.assertEqual(self._results(ok), [
+            {"type": "command_result", "command": "question_toggle", "ok": True, "request_id": "r1"}])
+        self.assertEqual(self._results(failed), [
+            {"type": "command_result", "command": "question_toggle", "ok": False, "request_id": "r2"}])
+
+    def test_submit_acknowledges_success_and_stale_prompt(self):
+        with loaded_relay() as relay:
+            ok = self._run(relay, {"type": "question_submit", "pane_id": "w1:p1", "prompt_id": "q",
+                                   "request_id": "r3"})
+            stale = self._run(relay, {"type": "question_submit", "pane_id": "w1:p1", "prompt_id": "q",
+                                      "request_id": "r4"}, matches=False)
+        self.assertEqual(self._results(ok), [
+            {"type": "command_result", "command": "question_submit", "ok": True, "request_id": "r3"}])
+        self.assertEqual(self._results(stale)[0]["ok"], False)
+
+    def test_no_request_id_means_no_acknowledgement(self):
+        with loaded_relay() as relay:
+            sent = self._run(relay, {"type": "question_toggle", "pane_id": "w1:p1", "option": "A",
+                                     "prompt_id": "q"})
+            sent += self._run(relay, {"type": "question_submit", "pane_id": "w1:p1", "prompt_id": "q"})
+        self.assertEqual(self._results(sent), [])
+
+
 class RelayKeyGrammarTests(unittest.TestCase):
     """The relay forwards keys in herdr's grammar, not tmux's.
 
