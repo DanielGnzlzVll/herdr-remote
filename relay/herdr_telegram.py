@@ -23,6 +23,12 @@ log = logging.getLogger("herdr-tg")
 TOKEN = os.environ.get("HERDR_TG_TOKEN", "")
 CHAT_ID = os.environ.get("HERDR_TG_CHAT_ID", "")
 RELAY_WS = os.environ.get("HERDR_RELAY", "ws://127.0.0.1:8375")
+CLOSE_GRACE = float(os.environ.get("HERDR_TG_CLOSE_GRACE", "20"))
+EPHEMERAL_TTL = float(os.environ.get("HERDR_TG_EPHEMERAL_TTL", "10"))
+COMMAND_TTL = float(os.environ.get("HERDR_TG_COMMAND_TTL", "600"))
+STATE_PATH = os.environ.get("HERDR_TG_STATE") or os.path.join(
+    os.environ.get("HERDR_LOG_DIR") or tg_chat.default_log_dir(), "telegram_chat.json"
+)
 RELAY_WS_SAFE = RELAY_WS.split("?", 1)[0]  # token-free variant for display and logging; never leak the token
 _RELAY_TOKEN = RELAY_WS.split("token=", 1)[1] if "token=" in RELAY_WS else ""
 
@@ -56,11 +62,18 @@ prev_statuses: dict[str, str] = {}  # pane_id -> last known status
 read_views: dict[tuple[int, str], int] = {}
 relay_connected = False
 daily_stats: dict[str, dict] = {}  # pane_id -> {agent, project, blocked_count, working_mins, last_change}
+tab_labels: dict[tuple[str, str], str] = {}  # (host, tab_id) -> tab label from the relay's spaces
+excerpts: dict[str, str] = {}  # card key -> last message read for the current done/idle episode
+chat_store = tg_chat.ChatStore(STATE_PATH)
+chat_state = tg_chat.ChatState()
+chat_wake = asyncio.Event()
 
 AGENT_PAGE_SIZE = 20
 PENDING_LIMIT = 500
 COMMAND_ACK_TIMEOUT = 20
 PANE_READ_TIMEOUT = 20
+CHAT_PASS_INTERVAL = 5
+EXCERPT_READ_LINES = 80
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 3}
 ACTION_CODES = {
     "read": "r",
@@ -268,6 +281,8 @@ def clear_relay_connection_state():
     agents = []
     approval_tokens.clear()
     blocked_prompt_ids.clear()
+    blocked_by_key.clear()
+    chat_wake.set()
 
 
 async def send_reply_prompt(message, chat, agent: dict, content: str | None = None):
@@ -1045,38 +1060,17 @@ def record_blocked(msg: dict) -> None:
     approval_tokens[pane_id] = approval_generation(pane_id, msg.get("prompt_id") or "")
 
 
-async def notify_blocked(app: Application, msg: dict):
-    if not CHAT_ID:
-        return
-    text = f"*{msg.get('agent', 'unknown')}* blocked in `{msg.get('project', '')}`\n\n```\n{msg.get('prompt', '')[:400]}\n```"
-    sent = await app.bot.send_message(
-        chat_id=int(CHAT_ID), text=text, parse_mode="Markdown",
-        reply_markup=to_markup(card_rows(msg["pane_id"], msg)),
-    )
-    register_pending(int(CHAT_ID), sent.message_id, msg["pane_id"])
-
-
-async def notify_blocked_safely(app: Application, msg: dict):
-    record_blocked(msg)
-    if msg.get("update"):
-        return
-    try:
-        await notify_blocked(app, msg)
-    except Exception as e:
-        log.warning("Failed to send blocked notification: %s", scrub(e))
-
-
 # --- Relay listener ---
 
-async def track_agent_updates(app: Application, updated_agents: list[dict]):
-    """Track status transitions for full snapshots and pane-level updates."""
+def track_agent_updates(updated_agents: list[dict]):
+    """Track status transitions for /digest and forget per-episode state the new status ends."""
     if not CHAT_ID:
         return
 
-    import time
     now = time.time()
     for agent_data in updated_agents:
         pane_id = agent_data["pane_id"]
+        key = tg_chat.agent_key(agent_data)
         new_status = agent_data.get("status", "unknown")
         old_status = prev_statuses.get(pane_id)
 
@@ -1098,65 +1092,185 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
         if agent_data.get("status") and new_status != "blocked":
             approval_tokens.pop(pane_id, None)
             blocked_prompt_ids.pop(pane_id, None)
-
-        if old_status and old_status != new_status and new_status in ("idle", "done") and old_status in ("working", "blocked"):
-            try:
-                msg = await app.bot.send_message(
-                    chat_id=int(CHAT_ID),
-                    text=(
-                        f"{agent_data['project']} ({agent_data['agent']}) finished.\n\n"
-                        "Open the output below, or reply to this notification to send a follow-up."
-                    ),
-                    reply_markup=interaction_keyboard(pane_id),
-                )
-                register_pending(int(CHAT_ID), msg.message_id, pane_id)
-            except Exception as e:
-                log.warning("Failed to send completion notification: %s", scrub(e))
+            blocked_by_key.pop(key, None)
+        if new_status in ("working", "blocked"):
+            excerpts.pop(key, None)
         prev_statuses[pane_id] = new_status
+
+
+def handle_relay_message(msg: dict):
+    global agents
+    kind = msg.get("type")
+    if kind == "agents":
+        spaces = msg.get("spaces") or {}
+        if spaces.get("tabs"):
+            tab_labels.clear()
+            for tab in spaces["tabs"]:
+                if tab.get("tab_id") and tab.get("label"):
+                    tab_labels[(tab.get("host") or "local", tab["tab_id"])] = tab["label"]
+        track_agent_updates(msg.get("agents", []))
+        agents = apply_agent_message(agents, msg)
+    elif kind == "agent_update":
+        updated_agent = msg.get("agent") or {}
+        if not updated_agent.get("pane_id"):
+            return
+        track_agent_updates([updated_agent])
+        agents = apply_agent_message(agents, msg)
+    elif kind == "blocked":
+        record_blocked(msg)
+    else:
+        return
+    chat_wake.set()
 
 
 async def relay_listener(app: Application):
     """Persistent WebSocket connection to relay."""
     import websockets
-    global agents, relay_connected, prev_statuses
+    global relay_connected
 
     while True:
         try:
             async with websockets.connect(RELAY_WS) as ws:
                 relay_connected = True
+                chat_wake.set()
                 log.info(f"Connected to relay at {RELAY_WS_SAFE}")
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-
-                    if msg.get("type") == "agents":
-                        new_agents = msg.get("agents", [])
-                        blocked_panes = {
-                            agent.get("pane_id") for agent in new_agents
-                            if agent.get("status") == "blocked"
-                        }
-                        for pane_id in list(approval_tokens):
-                            if pane_id not in blocked_panes:
-                                approval_tokens.pop(pane_id, None)
-                                blocked_prompt_ids.pop(pane_id, None)
-                        await track_agent_updates(app, new_agents)
-                        agents = apply_agent_message(agents, msg)
-
-                    elif msg.get("type") == "agent_update":
-                        updated_agent = msg.get("agent") or {}
-                        if updated_agent.get("pane_id"):
-                            await track_agent_updates(app, [updated_agent])
-                            agents = apply_agent_message(agents, msg)
-
-                    elif msg.get("type") == "blocked":
-                        await notify_blocked_safely(app, msg)
+                    handle_relay_message(msg)
                 clear_relay_connection_state()
         except Exception as e:
             clear_relay_connection_state()
-            log.warning(f"Relay connection lost: {e}, reconnecting in 5s...")
+            log.warning(f"Relay connection lost: {scrub(e)}, reconnecting in 5s...")
             await asyncio.sleep(5)
+
+
+# --- Chat reconciler ---
+
+async def card_excerpt(key: str, agent: dict) -> str:
+    """The last message for a done/idle card, read once per episode."""
+    if key in excerpts:
+        return excerpts[key]
+    card = chat_state.cards.get(key)
+    if card and card.status in ("done", "idle"):
+        excerpts[key] = card.last_message
+        return card.last_message
+    content = await read_pane(agent["pane_id"], lines=EXCERPT_READ_LINES)
+    failed = content.startswith("(error reading pane") or content == "(no response)"
+    excerpts[key] = "" if failed else tg_chat.extract_last_message(content)
+    return excerpts[key]
+
+
+async def desired_views() -> dict:
+    views = {}
+    for agent in list(agents):
+        key = tg_chat.agent_key(agent)
+        blocked = blocked_by_key.get(key)
+        status = "blocked" if blocked else agent.get("status", "unknown")
+        last_message = await card_excerpt(key, agent) if status in ("done", "idle") else ""
+        tab_label = tab_labels.get((agent.get("host") or "local", agent.get("tab_id", "")), "")
+        views[key] = tg_chat.render_card(agent, tab_label, blocked, last_message,
+                                         card_rows(agent["pane_id"], blocked))
+    return views
+
+
+async def delete_ids(bot, ids) -> None:
+    chat_id = int(CHAT_ID)
+    for batch in tg_chat.batches(ids):
+        try:
+            await bot.delete_messages(chat_id=chat_id, message_ids=batch)
+        except BadRequest:
+            for message_id in batch:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                except BadRequest:
+                    pass
+
+
+async def send_card(bot, action) -> int:
+    sent = await bot.send_message(
+        chat_id=int(CHAT_ID), text=action.view.text, reply_markup=to_markup(action.view.buttons),
+        disable_notification=not action.alert,
+    )
+    register_pending(int(CHAT_ID), sent.message_id, action.key.split("|", 1)[1])
+    return sent.message_id
+
+
+async def execute(bot, action) -> None:
+    """Carry out one planned action, committing it only once Telegram has accepted it."""
+    now = time.time()
+    if isinstance(action, tg_chat.AdvanceTimers):
+        tg_chat.apply(chat_state, action, now)
+    elif isinstance(action, tg_chat.Send):
+        tg_chat.apply(chat_state, action, now, await send_card(bot, action))
+    elif isinstance(action, tg_chat.Repost):
+        old = chat_state.cards[action.key].message_id
+        tg_chat.apply(chat_state, action, now, await send_card(bot, action))
+        chat_store.save(chat_state)
+        await delete_ids(bot, [old])
+        tg_chat.apply(chat_state, tg_chat.Delete((old,)), now)
+    elif isinstance(action, tg_chat.Edit):
+        card = chat_state.cards[action.key]
+        try:
+            await bot.edit_message_text(
+                chat_id=int(CHAT_ID), message_id=card.message_id, text=action.view.text,
+                reply_markup=to_markup(action.view.buttons),
+            )
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                pass
+            elif "not found" in str(e).lower():
+                tg_chat.apply(chat_state, tg_chat.Delete((), (action.key,)), now)
+                chat_wake.set()
+                return
+            else:
+                raise
+        tg_chat.apply(chat_state, action, now)
+    elif isinstance(action, (tg_chat.Delete, tg_chat.Sweep)):
+        await delete_ids(bot, action.ids)
+        tg_chat.apply(chat_state, action, now)
+    chat_store.save(chat_state)
+
+
+async def reconcile_once(bot, elapsed: float) -> None:
+    views = await desired_views()
+    for action in tg_chat.plan(chat_state, views, time.time(), relay_connected, elapsed, CLOSE_GRACE):
+        await execute(bot, action)
+
+
+def retry_seconds(exc: RetryAfter) -> float:
+    value = exc.retry_after
+    return float(value.total_seconds() if hasattr(value, "total_seconds") else value)
+
+
+async def chat_worker(bot):
+    """Converge the chat to the herd forever; a failed pass is simply recomputed by the next one."""
+    backoff = 0.0
+    last = time.monotonic()
+    while True:
+        try:
+            await asyncio.wait_for(chat_wake.wait(), timeout=CHAT_PASS_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+        chat_wake.clear()
+        now = time.monotonic()
+        elapsed, last = now - last, now
+        try:
+            await reconcile_once(bot, elapsed)
+            backoff = 0.0
+        except RetryAfter as e:
+            await asyncio.sleep(retry_seconds(e))
+        except BadRequest as e:
+            log.warning("Telegram refused a chat update: %s", scrub(e))
+        except NetworkError as e:
+            backoff = min(30.0, max(1.0, backoff * 2))
+            log.warning("Telegram unreachable (%s); retrying in %.0fs", scrub(e), backoff)
+            await asyncio.sleep(backoff)
+        except Exception:
+            log.exception("chat reconcile pass failed")
+            await asyncio.sleep(CHAT_PASS_INTERVAL)
 
 
 # --- Main ---
@@ -1184,9 +1298,13 @@ def main():
     asyncio.set_event_loop(loop)
 
     async def run():
+        global chat_state
+        chat_state = chat_store.load()
         async with app:
             await app.start()
             await app.updater.start_polling()
+            if CHAT_ID:
+                asyncio.create_task(chat_worker(app.bot))
             await relay_listener(app)
 
     loop.run_until_complete(run())

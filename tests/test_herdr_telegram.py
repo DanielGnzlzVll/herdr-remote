@@ -72,43 +72,24 @@ def loaded_telegram():
         return module
 
 
-class _Bot:
-    def __init__(self):
-        self.sent = []
-
-    async def send_message(self, **kwargs):
-        self.sent.append(kwargs)
-        return types.SimpleNamespace(message_id=42)
-
-
 class TelegramQuestionTests(unittest.TestCase):
-    def test_multi_select_notification_offers_toggles_and_submit(self):
+    def test_multi_select_card_offers_toggles_and_submit(self):
         telegram = loaded_telegram()
-        telegram.CHAT_ID = "1"
-        bot = _Bot()
-        app = types.SimpleNamespace(bot=bot)
+        telegram.record_blocked({
+            "pane_id": "pane-1",
+            "prompt_id": "q1",
+            "options": [],
+            "multi": True,
+            "interaction": "omp_question",
+            "multi_options": ["Color", "Font"],
+            "selected_options": [],
+        })
 
-        asyncio.run(
-            telegram.notify_blocked(app, {
-                "pane_id": "pane-1",
-                "agent": "omp",
-                "project": "demo",
-                "prompt": "Which capabilities?",
-                "prompt_id": "q1",
-                "options": [],
-                "multi": True,
-                "interaction": "omp_question",
-                "multi_options": ["Color", "Font"],
-                "selected_options": [],
-            })
-        )
-
-        markup = bot.sent[0]["reply_markup"]
+        rows = telegram.card_rows("pane-1", telegram.blocked_by_key["local|pane-1"])
         self.assertEqual(
-            [button.text for row in markup.inline_keyboard for button in row],
+            [label for row in rows for label, _data in row],
             ["☐ Color", "☐ Font", "Submit", "Open output & reply"],
         )
-        self.assertEqual(telegram.pending[(1, 42)], "pane-1")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import importlib
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,8 @@ sys.path.insert(0, str(ROOT / "relay"))
 os.environ.setdefault("HERDR_TG_TOKEN", "test-token")
 
 tg = importlib.import_module("herdr_telegram")
+tg_chat = importlib.import_module("tg_chat")
+from telegram.error import BadRequest, NetworkError  # noqa: E402
 
 
 def make_agents(count, *, status="idle", project="project"):
@@ -351,24 +354,13 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tg.parse_callback_data(send_button.callback_data)["action"], "select_send")
         self.assertEqual(tg.parse_callback_data(reply_button.callback_data)["action"], "select_reply")
 
-    async def test_done_agent_is_listed_and_sends_finished_notification(self):
+    async def test_done_agent_is_listed(self):
         tg.agents = make_agents(1, status="done", project="completed")
         update = make_update()
 
         await tg.cmd_agents(update, SimpleNamespace(args=[]))
 
         self.assertIn("DONE:", update.message.replies[0][0])
-        bot = FakeBot()
-        app = SimpleNamespace(bot=bot)
-        tg.prev_statuses["w0:p1"] = "working"
-        await tg.track_agent_updates(app, tg.agents)
-        chat_id, text, kwargs, sent = bot.sent[0]
-        self.assertEqual(chat_id, 42)
-        self.assertIn("completed (opencode) finished", text)
-        button = kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.text, "Open output & reply")
-        self.assertEqual(tg.parse_callback_data(button.callback_data)["pane_id"], "w0:p1")
-        self.assertEqual(tg.pending_pane(42, sent.message_id), "w0:p1")
 
     async def test_page_callback_rebuilds_from_latest_cache(self):
         tg.relay_connected = True
@@ -593,24 +585,6 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(tg.approval_generation("w0:p1", "q1"), tg.approval_generation("w0:p1", "q2"))
         self.assertNotEqual(tg.approval_generation("w0:p1", "q1"), tg.approval_generation("w1:p1", "q1"))
 
-    async def test_blocked_notification_failure_does_not_disconnect_relay(self):
-        tg.relay_connected = True
-        tg.agents = make_agents(1, status="blocked")
-        tg.approval_tokens["w0:p1"] = "previous"
-        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(side_effect=OSError("offline"))))
-
-        await tg.notify_blocked_safely(app, {
-            "pane_id": "w0:p1",
-            "agent": "opencode",
-            "project": "project",
-            "prompt": "prompt",
-            "options": ["yes", "no"],
-        })
-
-        self.assertTrue(tg.relay_connected)
-        self.assertEqual(tg.agents[0]["pane_id"], "w0:p1")
-        self.assertEqual(tg.approval_tokens["w0:p1"], tg.approval_generation("w0:p1", ""))
-
     async def test_graceful_relay_close_clears_connection_state(self):
         tg.relay_connected = True
         tg.agents = make_agents(1, status="blocked")
@@ -651,22 +625,6 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
             tg.register_pending(42, 1000 + message_id, f"pane:{message_id}")
         self.assertEqual(len(tg.pending), tg.PENDING_LIMIT)
         self.assertIsNone(tg.pending_pane(42, 1000))
-
-    async def test_blocked_notification_keeps_approvals_and_adds_interaction(self):
-        bot = FakeBot()
-        await tg.notify_blocked(SimpleNamespace(bot=bot), {
-            "pane_id": "w0:p1",
-            "agent": "opencode",
-            "project": "blocked-project",
-            "prompt": "Allow tool?",
-            "options": ["yes, single permission", "trust, always allow", "no (tab to edit)"],
-        })
-
-        chat_id, text, kwargs, sent = bot.sent[0]
-        rows = kwargs["reply_markup"].inline_keyboard
-        self.assertEqual([json.loads(row[0].callback_data)["k"] for row in rows[:3]], ["1", "2", "3"])
-        self.assertEqual(rows[-1][0].text, "Open output & reply")
-        self.assertEqual(tg.pending_pane(chat_id, sent.message_id), "w0:p1")
 
     async def test_group_prompts_keep_independent_pane_mappings(self):
         tg.relay_connected = True
@@ -903,20 +861,14 @@ class ApprovalDoubleTapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(send_keys.await_count, 1)
         self.assertIn("older prompt", second_tap.message.replies[0][0].lower())
 
-    async def test_blocked_update_refreshes_prompt_id_without_renotifying(self):
+    async def test_blocked_update_refreshes_prompt_id(self):
         tg.blocked_prompt_ids["w0:p1"] = "old"
-        app = SimpleNamespace(bot=FakeBot())
 
-        await tg.notify_blocked_safely(
-            app, {"type": "blocked", "pane_id": "w0:p1", "prompt_id": "new", "update": True}
-        )
-        await tg.notify_blocked_safely(
-            app, {"type": "blocked", "pane_id": "w0:p2", "prompt_id": "x", "update": True}
-        )
+        tg.handle_relay_message({"type": "blocked", "pane_id": "w0:p1", "prompt_id": "new", "update": True})
+        tg.handle_relay_message({"type": "blocked", "pane_id": "w0:p2", "prompt_id": "x", "update": True})
 
         self.assertEqual(tg.blocked_prompt_ids["w0:p1"], "new")
         self.assertEqual(tg.blocked_prompt_ids["w0:p2"], "x")
-        self.assertEqual(app.bot.sent, [])
 
 
 
@@ -1036,6 +988,188 @@ class MultiSelectTapTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "rejected question_submit"):
                 await tg.send_question_command_to_relay("question_submit", "w0:p1", "q1")
+
+
+
+class ChatBot:
+    """Telegram stand-in that records what reached the chat."""
+
+    def __init__(self):
+        self.sent, self.edits, self.deleted = [], [], []
+        self.next_id = 1000
+        self.send_error = None
+        self.edit_error = None
+
+    async def send_message(self, chat_id, text, reply_markup=None, disable_notification=False, **kwargs):
+        if self.send_error:
+            raise self.send_error
+        self.next_id += 1
+        message = SimpleNamespace(message_id=self.next_id, chat_id=chat_id)
+        self.sent.append(SimpleNamespace(text=text, markup=reply_markup, silent=disable_notification,
+                                         message_id=self.next_id))
+        return message
+
+    async def edit_message_text(self, chat_id, message_id, text, reply_markup=None, **kwargs):
+        if self.edit_error:
+            raise self.edit_error
+        self.edits.append(SimpleNamespace(message_id=message_id, text=text, markup=reply_markup))
+
+    async def delete_messages(self, chat_id, message_ids):
+        self.deleted.extend(message_ids)
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append(message_id)
+
+
+def worker_agent(status="working", **extra):
+    return {"pane_id": "w0:p1", "agent": "claude", "status": status, "project": "anima",
+            "cwd": "/work/anima", "host": "local", "tab_id": "w0:t1", **extra}
+
+
+class ChatWorkerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.old_chat_id = tg.CHAT_ID
+        self.old_store = tg.chat_store
+        self.tmp = tempfile.TemporaryDirectory()
+        tg.CHAT_ID = "42"
+        tg.chat_store = tg_chat.ChatStore(os.path.join(self.tmp.name, "chat.json"))
+        tg.chat_state = tg_chat.ChatState()
+        tg.relay_connected = True
+        tg.agents = []
+        tg.pending.clear()
+        tg.approval_tokens.clear()
+        tg.blocked_prompt_ids.clear()
+        tg.blocked_by_key.clear()
+        tg.prev_statuses.clear()
+        tg.excerpts.clear()
+        tg.tab_labels.clear()
+        self.bot = ChatBot()
+
+    def tearDown(self):
+        tg.CHAT_ID = self.old_chat_id
+        tg.chat_store = self.old_store
+        self.tmp.cleanup()
+
+    def snapshot(self, *agents):
+        tg.handle_relay_message({
+            "type": "agents", "agents": list(agents),
+            "spaces": {"workspaces": [], "tabs": [{"tab_id": "w0:t1", "host": "local", "label": "[1] logs"}]},
+        })
+
+    async def test_new_agent_gets_one_silent_card(self):
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        await tg.reconcile_once(self.bot, 0.0)
+
+        self.assertEqual(len(self.bot.sent), 1)
+        card = self.bot.sent[0]
+        self.assertTrue(card.silent)
+        self.assertTrue(card.text.startswith("🟡 WORKING · [1] logs"))
+        self.assertEqual(tg.pending_pane(42, card.message_id), "w0:p1")
+        self.assertEqual(tg.chat_store.load().cards["local|w0:p1"].message_id, card.message_id)
+
+    async def test_finished_agent_reposts_with_last_message_and_deletes_old(self):
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        old = self.bot.sent[0].message_id
+
+        self.snapshot(worker_agent(status="done"))
+        with patch.object(tg, "read_pane", AsyncMock(return_value="● All green.\n")) as read:
+            await tg.reconcile_once(self.bot, 0.0)
+            await tg.reconcile_once(self.bot, 0.0)
+
+        read.assert_awaited_once()
+        card = self.bot.sent[1]
+        self.assertFalse(card.silent)
+        self.assertIn("All green.", card.text)
+        self.assertIn(old, self.bot.deleted)
+        self.assertEqual(tg.chat_state.cards["local|w0:p1"].message_id, card.message_id)
+
+    async def test_blocked_card_carries_approval_buttons(self):
+        self.snapshot(worker_agent(status="blocked"))
+        tg.handle_relay_message({"type": "blocked", "pane_id": "w0:p1", "host": "local", "prompt": "Proceed?",
+                                 "prompt_id": "q1", "options": ["Yes", "No"], "interaction": "numbered"})
+        await tg.reconcile_once(self.bot, 0.0)
+
+        card = self.bot.sent[0]
+        self.assertFalse(card.silent)
+        labels = [b.text for row in card.markup.inline_keyboard for b in row]
+        self.assertEqual(labels, ["1. Yes", "2. No", "Open output & reply"])
+        generation = json.loads(card.markup.inline_keyboard[0][0].callback_data)["g"]
+        self.assertEqual(generation, tg.approval_tokens["w0:p1"])
+
+    async def test_leaving_blocked_forgets_the_prompt(self):
+        tg.handle_relay_message({"type": "blocked", "pane_id": "w0:p1", "host": "local", "prompt_id": "q1"})
+        self.snapshot(worker_agent(status="working"))
+        self.assertEqual(tg.blocked_by_key, {})
+        self.assertNotIn("w0:p1", tg.approval_tokens)
+
+    async def test_closed_agent_card_is_deleted_after_grace(self):
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        card = self.bot.sent[0].message_id
+
+        self.snapshot()
+        await tg.reconcile_once(self.bot, tg.CLOSE_GRACE - 1)
+        self.assertNotIn(card, self.bot.deleted)
+        await tg.reconcile_once(self.bot, 1.0)
+        self.assertIn(card, self.bot.deleted)
+        self.assertEqual(tg.chat_state.cards, {})
+
+    async def test_network_error_commits_nothing_and_next_pass_finishes(self):
+        self.snapshot(worker_agent())
+        self.bot.send_error = NetworkError("offline")
+        with self.assertRaises(NetworkError):
+            await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(tg.chat_state.cards, {})
+
+        self.bot.send_error = None
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(len(self.bot.sent), 1)
+
+    async def test_edit_of_a_deleted_card_sends_a_fresh_one(self):
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        self.snapshot(worker_agent(title="now testing"))
+        self.bot.edit_error = BadRequest("Message to edit not found")
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(tg.chat_state.cards, {})
+
+        self.bot.edit_error = None
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(len(self.bot.sent), 2)
+        self.assertIn("now testing", self.bot.sent[1].text)
+
+    async def test_not_modified_edit_counts_as_done(self):
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        self.snapshot(worker_agent(title="x"))
+        self.bot.edit_error = BadRequest("Message is not modified")
+        await tg.reconcile_once(self.bot, 0.0)
+        self.bot.edit_error = None
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual((len(self.bot.sent), self.bot.edits), (1, []))
+
+    async def test_first_start_sweeps_chat_history(self):
+        tg.chat_state = tg_chat.ChatState(high_water=30)
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(self.bot.deleted, list(range(1, 31)))
+        self.assertEqual(tg.chat_state.swept_to, 30)
+
+    async def test_restart_edits_stored_card_instead_of_sending(self):
+        stored = tg_chat.ChatState(high_water=7, swept_to=7)
+        stored.cards["local|w0:p1"] = tg_chat.CardState(7, tg.time.time(), "working", "", "stale-hash")
+        tg.chat_store.save(stored)
+        tg.chat_state = tg.chat_store.load()
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(self.bot.sent, [])
+        self.assertEqual([e.message_id for e in self.bot.edits], [7])
+
+    async def test_relay_messages_wake_the_worker(self):
+        tg.chat_wake.clear()
+        self.snapshot(worker_agent())
+        self.assertTrue(tg.chat_wake.is_set())
 
 
 if __name__ == "__main__":
