@@ -67,6 +67,7 @@ excerpts: dict[str, str] = {}  # card key -> last message read for the current d
 chat_store = tg_chat.ChatStore(STATE_PATH)
 chat_state = tg_chat.ChatState()
 chat_wake = asyncio.Event()
+sends_in_flight = 0
 
 AGENT_PAGE_SIZE = 20
 PENDING_LIMIT = 500
@@ -160,12 +161,15 @@ async def send_question_command_to_relay(command: str, pane_id: str, prompt_id: 
         await await_command_result(ws, request_id, command)
 
 
-async def read_pane(pane_id: str, lines: int = 15) -> str:
+async def read_pane(pane_id: str, lines: int = 15, source: str | None = None) -> str:
     """Read pane content from relay."""
     import websockets
+    request = {"type": "read_pane", "pane_id": pane_id, "lines": lines}
+    if source:
+        request["source"] = source
     try:
         async with websockets.connect(RELAY_WS) as ws:
-            await ws.send(json.dumps({"type": "read_pane", "pane_id": pane_id, "lines": lines}))
+            await ws.send(json.dumps(request))
             loop = asyncio.get_running_loop()
             deadline = loop.time() + PANE_READ_TIMEOUT
             # The connect preamble (sessions/agents/one-blocked-per-blocked-
@@ -225,19 +229,30 @@ def remember(message, kind: str, owner: str = "", supersede: bool = False) -> No
     if not CHAT_ID or message is None or str(getattr(message, "chat_id", "")) != CHAT_ID:
         return
     now = time.time()
-    deadline = {"ephemeral": now + EPHEMERAL_TTL, "command": now + COMMAND_TTL}.get(kind)
-    tg_chat.record_transient(chat_state, message.message_id, kind, owner, deadline, now, supersede)
+    ttl = EPHEMERAL_TTL if kind == "ephemeral" else COMMAND_TTL
+    tg_chat.record_transient(chat_state, message.message_id, kind, owner, now + ttl, now, supersede)
     chat_wake.set()
 
 
+async def tracked_reply(message, text: str, **kwargs):
+    """Send a handler reply; while any is in flight the worker does not sweep, because Telegram may
+    already have given it an id below a card the worker has just sent."""
+    global sends_in_flight
+    sends_in_flight += 1
+    try:
+        return await message.reply_text(text, **kwargs)
+    finally:
+        sends_in_flight -= 1
+
+
 async def reply_ephemeral(message, text: str, **kwargs):
-    sent = await message.reply_text(text, **kwargs)
+    sent = await tracked_reply(message, text, **kwargs)
     remember(sent, "ephemeral")
     return sent
 
 
 async def reply_command(message, command: str, text: str, **kwargs):
-    sent = await message.reply_text(text, **kwargs)
+    sent = await tracked_reply(message, text, **kwargs)
     remember(sent, "command", command)
     return sent
 
@@ -245,6 +260,14 @@ async def reply_command(message, command: str, text: str, **kwargs):
 def pane_key(pane_id: str) -> str:
     agent = find_agent(pane_id)
     return tg_chat.agent_key(agent) if agent else tg_chat.card_key(None, pane_id)
+
+
+def card_pane(message_id: int) -> str | None:
+    """The pane a card belongs to; `pending` is lost on restart while cards survive it."""
+    for key, card in chat_state.cards.items():
+        if card.message_id == int(message_id):
+            return key.split("|", 1)[1]
+    return None
 
 
 async def record_incoming(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -296,10 +319,10 @@ async def show_pane_view(bot, chat_id: int, message, pane_id: str, header: str, 
             if "not modified" in str(e).lower():
                 return existing
             read_views.pop(key, None)
-    sent = await message.reply_text(text, parse_mode="MarkdownV2")
+    sent = await tracked_reply(message, text, parse_mode="MarkdownV2")
     read_views[key] = sent.message_id
     register_pending(chat_id, sent.message_id, pane_id)
-    remember(sent, "linked", pane_key(pane_id))
+    remember(sent, "linked", pane_key(pane_id), supersede=True)
     return sent.message_id
 
 
@@ -331,9 +354,9 @@ async def send_reply_prompt(message, chat, agent: dict, content: str | None = No
             selective=True,
             input_field_placeholder=f"Reply to {project}"[:64],
         )
-    sent = await message.reply_text("\n".join(parts), **kwargs)
+    sent = await tracked_reply(message, "\n".join(parts), **kwargs)
     register_pending(chat.id, sent.message_id, agent["pane_id"])
-    remember(sent, "linked", tg_chat.agent_key(agent))
+    remember(sent, "linked", tg_chat.agent_key(agent), supersede=True)
     return sent
 
 
@@ -951,7 +974,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Send a Telegram reply to its associated agent pane."""
     if not authorized(update) or not update.message.reply_to_message:
         return
-    pane_id = pending_pane(update.effective_chat.id, update.message.reply_to_message.message_id)
+    replied_to = update.message.reply_to_message.message_id
+    pane_id = pending_pane(update.effective_chat.id, replied_to) or card_pane(replied_to)
     if not pane_id:
         return
     if not relay_connected:
@@ -1030,10 +1054,16 @@ def toggle_label(option: str, selected: bool) -> str:
 
 def card_rows(pane_id: str, blocked: dict | None) -> tuple:
     """The buttons a card carries, as plain (label, callback_data) rows."""
-    if not blocked or blocked.get("text_field"):
+    if not blocked:
         return (open_output_row(pane_id),)
     generation = approval_generation(pane_id, blocked.get("prompt_id") or "")
     multi_options = blocked.get("multi_options") or []
+    submit_row = (("Submit", pane_callback_data("submit", pane_id, g=generation)),)
+    if blocked.get("text_field"):
+        # Typed text sits in the question's own row until Submit takes it.
+        if blocked.get("multi") and multi_options:
+            return (submit_row, open_output_row(pane_id))
+        return (open_output_row(pane_id),)
     if blocked.get("multi") and multi_options:
         selected = set(blocked.get("selected_options") or [])
         rows = [
@@ -1041,7 +1071,7 @@ def card_rows(pane_id: str, blocked: dict | None) -> tuple:
               pane_callback_data("toggle", pane_id, g=generation, i=str(i))),)
             for i, option in enumerate(multi_options)
         ]
-        rows.append((("Submit", pane_callback_data("submit", pane_id, g=generation)),))
+        rows.append(submit_row)
         rows.append(open_output_row(pane_id))
         return tuple(rows)
     options = blocked.get("options") or []
@@ -1098,7 +1128,14 @@ def record_blocked(msg: dict) -> None:
     pane_id = msg.get("pane_id")
     if not pane_id:
         return
-    blocked_by_key[tg_chat.card_key(msg.get("host"), pane_id)] = msg
+    key = tg_chat.card_key(msg.get("host"), pane_id)
+    previous = blocked_by_key.get(key)
+    # An `update` is the same question redrawn, whose prompt_id can move on every repaint; only a
+    # fresh blocked message starts a new question worth another alert.
+    alert_id = msg.get("prompt_id") or ""
+    if msg.get("update") and previous:
+        alert_id = previous.get("alert_id", alert_id)
+    blocked_by_key[key] = {**msg, "alert_id": alert_id}
     if msg.get("prompt_id"):
         blocked_prompt_ids[pane_id] = msg["prompt_id"]
     approval_tokens[pane_id] = approval_generation(pane_id, msg.get("prompt_id") or "")
@@ -1201,7 +1238,9 @@ async def card_excerpt(key: str, agent: dict) -> str:
     if card and card.status in ("done", "idle"):
         excerpts[key] = card.last_message
         return card.last_message
-    content = await read_pane(agent["pane_id"], lines=EXCERPT_READ_LINES)
+    # Automatic reads must stay on the visible screen: a `recent` read on an idle agent scrolls
+    # the operator's terminal to harvest history.
+    content = await read_pane(agent["pane_id"], lines=EXCERPT_READ_LINES, source="visible")
     failed = content.startswith("(error reading pane") or content == "(no response)"
     excerpts[key] = "" if failed else tg_chat.extract_last_message(content)
     return excerpts[key]
@@ -1287,8 +1326,15 @@ async def reconcile_once(bot, elapsed: float, probe: bool = False) -> None:
         planned = {getattr(action, "key", None) for action in actions}
         actions += [tg_chat.Edit(key, view) for key, view in views.items()
                     if key in chat_state.cards and key not in planned]
+    if sends_in_flight:
+        actions = [action for action in actions if not isinstance(action, tg_chat.Sweep)]
     for action in actions:
-        await execute(bot, action)
+        try:
+            await execute(bot, action)
+        except BadRequest as e:
+            log.warning("Telegram refused %s: %s", type(action).__name__, scrub(e))
+    if chat_state.swept_to < chat_state.high_water:
+        chat_wake.set()
 
 
 def retry_seconds(exc: RetryAfter) -> float:

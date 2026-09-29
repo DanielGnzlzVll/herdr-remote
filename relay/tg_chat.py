@@ -13,6 +13,7 @@ EXCERPT_CHARS = 600
 PROMPT_CHARS = 400
 CARD_MAX_AGE = 47 * 3600
 SWEEP_BATCH = 100
+SWEEP_PASS_SPAN = 500
 WAITING_FOR_TEXT = "✍️ Waiting for text — reply to this card with your answer."
 REPLY_TO_ANSWER = "Reply to this card to answer."
 
@@ -139,7 +140,7 @@ def render_card(agent: dict, tab_label: str, blocked: dict | None, last_message:
         text=text,
         buttons=buttons,
         status=status,
-        prompt_id=(blocked or {}).get("prompt_id") or "",
+        prompt_id=(blocked or {}).get("alert_id") or (blocked or {}).get("prompt_id") or "",
         last_message=last_message if status in ("done", "idle") else "",
     )
 
@@ -280,12 +281,14 @@ def plan(state: ChatState, views: dict, now: float, relay_connected: bool,
         actions.append(Delete(tuple(sorted(deleting)), tuple(sorted(gone))))
 
     if state.high_water > state.swept_to:
+        # Bounded so a first start's whole-history sweep cannot hold card updates back.
+        end = min(state.high_water, state.swept_to + SWEEP_PASS_SPAN)
         desired = {card.message_id for card in state.cards.values()} | set(state.transients)
         ids = tuple(
-            i for i in range(state.swept_to + 1, state.high_water + 1)
+            i for i in range(state.swept_to + 1, end + 1)
             if i not in desired and i not in deleting
         )
-        actions.append(Sweep(ids, state.high_water))
+        actions.append(Sweep(ids, end))
     return actions
 
 
@@ -353,7 +356,7 @@ class ChatStore:
         try:
             with open(self.path, encoding="utf-8") as fh:
                 return state_from_json(fh.read())
-        except (OSError, ValueError, TypeError, KeyError):
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
             return ChatState()
 
     def save(self, state: ChatState) -> None:

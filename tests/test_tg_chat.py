@@ -215,6 +215,12 @@ class PlanTests(unittest.TestCase):
         self.assertNotIn(245, sweep.ids)
         self.assertEqual([len(b) for b in chat.batches(sweep.ids)], [100, 100, 48])
 
+    def test_sweep_is_bounded_per_pass(self):
+        state = chat.ChatState(high_water=1200, swept_to=0)
+        sweep = chat.plan(state, {}, 2000.0, True, 1.0, 20)[-1]
+        self.assertEqual(sweep.new_swept_to, chat.SWEEP_PASS_SPAN)
+        self.assertEqual(max(sweep.ids), chat.SWEEP_PASS_SPAN)
+
     def test_nothing_to_sweep_when_watermarks_meet(self):
         state = state_with_card()
         self.assertEqual(chat.plan(state, {KEY: view()}, 2000.0, True, 1.0, 20), [])
@@ -323,6 +329,8 @@ class ChatStoreTests(unittest.TestCase):
             Path(path).write_text("{not json")
             self.assertEqual(chat.ChatStore(path).load(), chat.ChatState())
             Path(path).write_text('{"cards": {}}')
+            self.assertEqual(chat.ChatStore(path).load(), chat.ChatState())
+            Path(path).write_text('{"cards": [], "transients": [], "high_water": 0, "swept_to": 0}')
             self.assertEqual(chat.ChatStore(path).load(), chat.ChatState())
 
 

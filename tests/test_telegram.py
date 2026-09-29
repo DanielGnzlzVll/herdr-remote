@@ -889,8 +889,14 @@ class CardRowsTests(unittest.TestCase):
 
     def test_plain_and_text_field_cards_only_open_output(self):
         self.assertEqual(rows_text(tg.card_rows("w0:p1", None)), ["Open output & reply"])
-        typing = {**MULTI, "text_field": True}
+        typing = {"pane_id": "w0:p1", "prompt_id": "q", "options": ["Yes"], "text_field": True}
         self.assertEqual(rows_text(tg.card_rows("w0:p1", typing)), ["Open output & reply"])
+
+    def test_typing_into_a_multi_select_keeps_submit(self):
+        typing = {**MULTI, "text_field": True}
+        rows = tg.card_rows("w0:p1", typing)
+        self.assertEqual(rows_text(rows), ["Submit", "Open output & reply"])
+        self.assertEqual(tg.parse_callback_data(rows[0][0][1])["action"], "submit")
 
     def test_multi_select_rows_toggle_submit_and_open(self):
         rows = tg.card_rows("w0:p1", MULTI)
@@ -1213,6 +1219,98 @@ class ChatWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tg.retry_seconds(RetryAfter(7)), 7.0)
         self.assertEqual(tg.retry_seconds(RetryAfter(timedelta(seconds=3))), 3.0)
 
+    async def test_reply_to_a_card_after_restart_reaches_the_agent(self):
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        tg.pending.clear()
+        message = FakeMessage()
+        message.reply_to_message = SimpleNamespace(message_id=self.bot.sent[0].message_id)
+        message.text = "go on"
+        with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
+            await tg.handle_text(make_update(message=message), SimpleNamespace())
+        send_text.assert_awaited_once_with("w0:p1", "go on")
+
+    async def test_blocked_updates_with_new_prompt_ids_edit_without_alerting(self):
+        self.snapshot(worker_agent(status="blocked"))
+        base = {"type": "blocked", "pane_id": "w0:p1", "host": "local", "options": [],
+                "interaction": "prompt"}
+        tg.handle_relay_message({**base, "prompt": "Waiting 1s", "prompt_id": "q1"})
+        await tg.reconcile_once(self.bot, 0.0)
+        for i in range(2, 5):
+            tg.handle_relay_message({**base, "prompt": f"Waiting {i}s", "prompt_id": f"q{i}", "update": True})
+            await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(len(self.bot.sent), 1)
+        self.assertEqual(len(self.bot.edits), 3)
+        self.assertEqual(tg.blocked_prompt_ids["w0:p1"], "q4")
+
+        tg.handle_relay_message({**base, "prompt": "Another question", "prompt_id": "q9"})
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(len(self.bot.sent), 2)
+        self.assertFalse(self.bot.sent[1].silent)
+
+    async def test_excerpt_reads_only_the_visible_screen(self):
+        self.snapshot(worker_agent(status="done"))
+        with patch.object(tg, "read_pane", AsyncMock(return_value="● ok\n")) as read:
+            await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(read.await_args.kwargs.get("source"), "visible")
+
+    async def test_read_pane_forwards_the_source(self):
+        relay = FakeRelayConnection([{"type": "pane_content", "content": "x"}])
+        with patch("websockets.connect", return_value=relay):
+            await tg.read_pane("w0:p1", lines=80, source="visible")
+        self.assertEqual(relay.sent[0]["source"], "visible")
+        relay = FakeRelayConnection([{"type": "pane_content", "content": "x"}])
+        with patch("websockets.connect", return_value=relay):
+            await tg.read_pane("w0:p1")
+        self.assertNotIn("source", relay.sent[0])
+
+    async def test_sweep_waits_for_handler_replies_in_flight(self):
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        gate = asyncio.Event()
+
+        class SlowMessage(FakeMessage):
+            async def reply_text(self, text, **kwargs):
+                await gate.wait()
+                return SimpleNamespace(message_id=1500, chat_id=42)
+
+        pending_reply = asyncio.create_task(tg.reply_command(SlowMessage(), "status", "x"))
+        await asyncio.sleep(0)
+        self.bot.next_id = 1600
+        self.snapshot(worker_agent(), worker_agent(pane_id="w1:p1", tab_id="w1:t1"))
+        await tg.reconcile_once(self.bot, 0.0)
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertNotIn(1500, self.bot.deleted)
+
+        gate.set()
+        await pending_reply
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertNotIn(1500, self.bot.deleted)
+        self.assertIn(1500, tg.chat_state.transients)
+
+    async def test_first_start_sweep_continues_across_passes(self):
+        tg.chat_state = tg_chat.ChatState(high_water=1200)
+        tg.chat_wake.clear()
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(tg.chat_state.swept_to, tg_chat.SWEEP_PASS_SPAN)
+        self.assertTrue(tg.chat_wake.is_set())
+        await tg.reconcile_once(self.bot, 0.0)
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(tg.chat_state.swept_to, 1200)
+
+    async def test_a_rejected_card_does_not_stall_the_others(self):
+        original = self.bot.send_message
+
+        async def refuse_bad(chat_id, text, **kwargs):
+            if "📁 bad" in text:
+                raise BadRequest("Bad Request: can't parse entities")
+            return await original(chat_id, text, **kwargs)
+
+        self.bot.send_message = refuse_bad
+        self.snapshot(worker_agent(project="bad"), worker_agent(pane_id="w1:p1", tab_id="w1:t1"))
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(set(tg.chat_state.cards), {"local|w1:p1"})
+
     async def test_relay_messages_wake_the_worker(self):
         tg.chat_wake.clear()
         self.snapshot(worker_agent())
@@ -1273,6 +1371,18 @@ class TransientMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.transient(sent.message_id).kind, self.transient(sent.message_id).owner),
                          ("linked", "local|w0:p1"))
 
+    async def test_newer_reply_prompt_replaces_the_older_one(self):
+        first = FakeCallback({"action": "select_reply", "pane_id": "w0:p1"}, message_id=10)
+        second = FakeCallback({"action": "select_reply", "pane_id": "w0:p1"}, message_id=11)
+        with patch.object(tg, "read_pane", AsyncMock(return_value="output")):
+            await tg.handle_callback(make_update(callback=first), SimpleNamespace())
+            with patch.object(tg.time, "time", return_value=5000.0):
+                await tg.handle_callback(make_update(callback=second), SimpleNamespace())
+        old = self.transient(first.message.replies[0][2].message_id)
+        new = self.transient(second.message.replies[0][2].message_id)
+        self.assertEqual(old.deadline, 5000.0)
+        self.assertEqual(new.deadline, 5000.0 + tg.COMMAND_TTL)
+
     async def test_any_incoming_message_is_recorded_before_handling(self):
         message = FakeMessage(message_id=55)
         await tg.record_incoming(SimpleNamespace(effective_message=message), make_context())
@@ -1301,7 +1411,7 @@ class TransientMessageTests(unittest.IsolatedAsyncioTestCase):
 
     def test_every_reply_goes_through_a_lifetime_helper(self):
         tree = ast.parse((ROOT / "relay" / "herdr_telegram.py").read_text(encoding="utf-8"))
-        allowed = {"reply_ephemeral", "reply_command", "show_pane_view", "send_reply_prompt", "send_card"}
+        allowed = {"tracked_reply", "send_card"}
         offenders = []
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or fn.name in allowed:
