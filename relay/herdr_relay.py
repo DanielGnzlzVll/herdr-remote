@@ -2647,6 +2647,13 @@ async def event_push():
 
         if pane_id and event.get("type") == "agent_event":
             agents, shells = await asyncio.to_thread(get_all_panes)
+            # Same promotion as _poll_once: herdr misses a question the probe found, and a
+            # snapshot that reports it `done` makes clients drop the pane's prompt.
+            for a in agents:
+                if question_panes.get((a.get("host", "local"), a["pane_id"])):
+                    a["status"] = "blocked"
+            if update and question_panes.get((host, pane_id)):
+                update = {**update, "agent": {**update["agent"], "status": "blocked"}}
             if status == "blocked" and not any(
                 agent["pane_id"] == pane_id for agent in agents
             ):

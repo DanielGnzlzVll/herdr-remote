@@ -2034,6 +2034,36 @@ class RelayCommandTests(unittest.TestCase):
 
 
 class RelayEventPushTests(unittest.IsolatedAsyncioTestCase):
+    async def test_event_path_keeps_a_probed_question_blocked(self):
+        pane = {"pane_id": "q-pane", "agent": "claude", "status": "done", "cwd": "/p/q",
+                "project": "q", "host": "local", "remote": None}
+        event = {"type": "agent_event", "pane_id": "q-pane", "agent": "claude", "status": "done",
+                 "cwd": "/p/q", "project": "q", "host": "local"}
+        with loaded_relay() as relay:
+            relay.question_panes[("local", "q-pane")] = True
+            messages = []
+            done = asyncio.Event()
+
+            async def capture(message):
+                messages.append(message)
+                if len(messages) == 2:
+                    done.set()
+
+            with mock.patch.object(relay, "get_all_panes", return_value=([dict(pane)], [])), \
+                 mock.patch.object(relay, "broadcast", side_effect=capture):
+                task = asyncio.create_task(relay.event_push())
+                try:
+                    await relay.event_queue.put(event)
+                    await asyncio.wait_for(done.wait(), timeout=1)
+                finally:
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+
+        self.assertEqual(messages[0]["agents"][0]["status"], "blocked")
+        self.assertEqual(messages[1]["type"], "agent_update")
+        self.assertEqual(messages[1]["agent"]["status"], "blocked")
+
     async def test_blocked_agent_event_broadcasts_snapshot_before_blocked_prompt(self):
         complete_snapshot = [
             {
