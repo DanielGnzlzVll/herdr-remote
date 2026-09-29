@@ -1166,6 +1166,53 @@ class ChatWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.sent, [])
         self.assertEqual([e.message_id for e in self.bot.edits], [7])
 
+    async def test_probe_finds_a_card_deleted_by_hand(self):
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        self.bot.edit_error = BadRequest("Message is not modified")
+        await tg.reconcile_once(self.bot, 0.0, probe=True)
+        self.assertEqual(len(tg.chat_state.cards), 1)
+
+        self.bot.edit_error = BadRequest("Message to edit not found")
+        await tg.reconcile_once(self.bot, 0.0, probe=True)
+        self.bot.edit_error = None
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(len(self.bot.sent), 2)
+        self.assertEqual(tg.chat_state.cards["local|w0:p1"].message_id, self.bot.sent[1].message_id)
+
+    async def test_undeletable_history_is_skipped_and_sweep_completes(self):
+        tg.chat_state = tg_chat.ChatState(high_water=3)
+        refused = []
+
+        async def refuse_batch(chat_id, message_ids):
+            raise BadRequest("Message can't be deleted")
+
+        async def refuse_one(chat_id, message_id):
+            refused.append(message_id)
+            raise BadRequest("Message can't be deleted for everyone")
+
+        self.bot.delete_messages = refuse_batch
+        self.bot.delete_message = refuse_one
+        await tg.reconcile_once(self.bot, 0.0)
+        self.assertEqual(refused, [1, 2, 3])
+        self.assertEqual(tg.chat_state.swept_to, 3)
+
+    async def test_long_relay_outage_keeps_every_card(self):
+        self.snapshot(worker_agent())
+        await tg.reconcile_once(self.bot, 0.0)
+        card = self.bot.sent[0].message_id
+        tg.clear_relay_connection_state()
+        for _ in range(10):
+            await tg.reconcile_once(self.bot, 60.0)
+        self.assertNotIn(card, self.bot.deleted)
+        self.assertEqual(tg.chat_state.cards["local|w0:p1"].message_id, card)
+
+    def test_retry_after_accepts_seconds_and_timedelta(self):
+        from datetime import timedelta
+        from telegram.error import RetryAfter
+        self.assertEqual(tg.retry_seconds(RetryAfter(7)), 7.0)
+        self.assertEqual(tg.retry_seconds(RetryAfter(timedelta(seconds=3))), 3.0)
+
     async def test_relay_messages_wake_the_worker(self):
         tg.chat_wake.clear()
         self.snapshot(worker_agent())
@@ -1231,6 +1278,12 @@ class TransientMessageTests(unittest.IsolatedAsyncioTestCase):
         await tg.record_incoming(SimpleNamespace(effective_message=message), make_context())
         self.assertEqual(self.transient(55).kind, "ephemeral")
         self.assertEqual(tg.chat_state.high_water, 55)
+
+    async def test_discovery_mode_tracks_nothing(self):
+        tg.CHAT_ID = ""
+        await tg.record_incoming(SimpleNamespace(effective_message=FakeMessage(message_id=57)), make_context())
+        await tg.reply_ephemeral(FakeMessage(), "hello")
+        self.assertEqual(tg.chat_state, tg_chat.ChatState())
 
     async def test_messages_from_other_chats_are_not_tracked(self):
         await tg.record_incoming(SimpleNamespace(effective_message=FakeMessage(chat_id=7, message_id=56)),

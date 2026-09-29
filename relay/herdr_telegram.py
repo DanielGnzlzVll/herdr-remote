@@ -73,6 +73,7 @@ PENDING_LIMIT = 500
 COMMAND_ACK_TIMEOUT = 20
 PANE_READ_TIMEOUT = 20
 CHAT_PASS_INTERVAL = 5
+CARD_PROBE_INTERVAL = 600
 EXCERPT_READ_LINES = 80
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 3}
 ACTION_CODES = {
@@ -1277,9 +1278,16 @@ async def execute(bot, action) -> None:
     chat_store.save(chat_state)
 
 
-async def reconcile_once(bot, elapsed: float) -> None:
+async def reconcile_once(bot, elapsed: float, probe: bool = False) -> None:
     views = await desired_views()
-    for action in tg_chat.plan(chat_state, views, time.time(), relay_connected, elapsed, CLOSE_GRACE):
+    actions = tg_chat.plan(chat_state, views, time.time(), relay_connected, elapsed, CLOSE_GRACE)
+    if probe:
+        # Telegram cannot list a chat, so an identical edit is how a card deleted by hand is found:
+        # "not modified" means it is still there, "not found" drops it and the next pass re-sends it.
+        planned = {getattr(action, "key", None) for action in actions}
+        actions += [tg_chat.Edit(key, view) for key, view in views.items()
+                    if key in chat_state.cards and key not in planned]
+    for action in actions:
         await execute(bot, action)
 
 
@@ -1291,7 +1299,7 @@ def retry_seconds(exc: RetryAfter) -> float:
 async def chat_worker(bot):
     """Converge the chat to the herd forever; a failed pass is simply recomputed by the next one."""
     backoff = 0.0
-    last = time.monotonic()
+    last = last_probe = time.monotonic()
     while True:
         try:
             await asyncio.wait_for(chat_wake.wait(), timeout=CHAT_PASS_INTERVAL)
@@ -1300,9 +1308,12 @@ async def chat_worker(bot):
         chat_wake.clear()
         now = time.monotonic()
         elapsed, last = now - last, now
+        probe = now - last_probe >= CARD_PROBE_INTERVAL
         try:
-            await reconcile_once(bot, elapsed)
+            await reconcile_once(bot, elapsed, probe)
             backoff = 0.0
+            if probe:
+                last_probe = now
         except RetryAfter as e:
             await asyncio.sleep(retry_seconds(e))
         except BadRequest as e:
