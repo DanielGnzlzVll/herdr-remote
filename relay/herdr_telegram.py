@@ -4,13 +4,16 @@
 # dependencies = ["python-telegram-bot>=21.0", "websockets>=14.0"]
 # ///
 """herdr-remote Telegram bot — monitor and approve agents from Telegram."""
-import asyncio, hashlib, json, os, logging, secrets
+import asyncio, hashlib, json, os, logging, secrets, time
 from collections import Counter, OrderedDict
 
 from telegram import ForceReply, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
 
+import tg_chat
 from agent_state import apply_agent_message
+from tg_chat import STATUS_LABELS
 
 logging.basicConfig(level=logging.INFO)
 # httpx logs every request URL at INFO; that URL contains the bot token. Silence it.
@@ -45,6 +48,7 @@ pending: OrderedDict[tuple[int, int], str] = OrderedDict()  # (chat_id, message_
 approval_tokens: dict[str, str] = {}  # pane_id -> current blocked-notification generation
 blocked_prompt_ids: dict[str, str] = {}  # pane_id -> current relay prompt identity
 approval_in_flight: set[str] = set()  # panes whose tapped choice is still being delivered
+blocked_by_key: dict[str, dict] = {}  # card key -> latest relay "blocked" message for that pane
 agents: list[dict] = []       # current agent list from relay
 prev_statuses: dict[str, str] = {}  # pane_id -> last known status
 # One live-view message per pane, edited in place on every /read so repeated reads refresh a
@@ -58,7 +62,6 @@ PENDING_LIMIT = 500
 COMMAND_ACK_TIMEOUT = 20
 PANE_READ_TIMEOUT = 20
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 3}
-STATUS_LABELS = {"blocked": "BLOCKED", "working": "WORKING", "done": "DONE", "idle": "IDLE", "unknown": "IDLE"}
 ACTION_CODES = {
     "read": "r",
     "interrupt": "i",
@@ -66,6 +69,8 @@ ACTION_CODES = {
     "select_reply": "q",
     "trust": "t",
     "approval": "k",
+    "toggle": "x",
+    "submit": "u",
 }
 CODE_ACTIONS = {code: action for action, code in ACTION_CODES.items()}
 
@@ -127,6 +132,18 @@ async def send_keys_to_relay(pane_id: str, keys: list[str], prompt_id: str | Non
             message["prompt_id"] = prompt_id
         await ws.send(json.dumps(message))
         await await_command_result(ws, request_id, "send_keys")
+
+
+async def send_question_command_to_relay(command: str, pane_id: str, prompt_id: str, option: str | None = None):
+    """Toggle or submit a multi-select question; waits for the relay's command_result."""
+    import websockets
+    async with websockets.connect(RELAY_WS) as ws:
+        request_id = secrets.token_hex(8)
+        message = {"type": command, "pane_id": pane_id, "prompt_id": prompt_id, "request_id": request_id}
+        if option is not None:
+            message["option"] = option
+        await ws.send(json.dumps(message))
+        await await_command_result(ws, request_id, command)
 
 
 async def read_pane(pane_id: str, lines: int = 15) -> str:
@@ -649,7 +666,8 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # --- Callback handler (buttons) ---
 
-async def deliver_choice(query, pane_id: str, label: str, deliver) -> bool:
+async def deliver_choice(query, pane_id: str, label: str, deliver, consume: bool = True,
+                         confirm: bool = True) -> bool:
     """Acknowledge a tapped choice at once, deliver it exactly once, then confirm or roll back.
 
     Telegram shows nothing for a tap until the bot edits or replies, and the relay plus two
@@ -658,7 +676,8 @@ async def deliver_choice(query, pane_id: str, label: str, deliver) -> bool:
     duplicate "1" was typed into the agent's input line instead. So: the buttons come off the
     message BEFORE delivery (that is the feedback), a second tap during delivery is refused,
     and a failed delivery puts the buttons back so the user can retry. Returns True on
-    success.
+    success. A checkbox toggle passes consume=False (the question stays open for more taps) and
+    confirm=False (the card's redrawn checkbox is the confirmation).
     """
     if pane_id in approval_in_flight:
         await query.message.reply_text(
@@ -673,7 +692,8 @@ async def deliver_choice(query, pane_id: str, label: str, deliver) -> bool:
         pass
     try:
         await deliver()
-        approval_tokens.pop(pane_id, None)
+        if consume:
+            approval_tokens.pop(pane_id, None)
     except Exception as e:
         try:
             await query.edit_message_reply_markup(reply_markup=previous_markup)
@@ -683,7 +703,8 @@ async def deliver_choice(query, pane_id: str, label: str, deliver) -> bool:
         return False
     finally:
         approval_in_flight.discard(pane_id)
-    await query.message.reply_text(f"Sent: {label}")
+    if confirm:
+        await query.message.reply_text(f"Sent: {label}")
     return True
 
 
@@ -713,8 +734,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     selected_agent = None
-    if action in {"read", "interrupt", "select_send", "select_reply", "trust", "approval"}:
-        eligible_action = "trust" if action == "approval" else action
+    if action in {"read", "interrupt", "select_send", "select_reply", "trust", "approval", "toggle", "submit"}:
+        eligible_action = "trust" if action in ("approval", "toggle", "submit") else action
         selected_agent = next(
             (agent for agent in agents_for_action(eligible_action) if agent.get("pane_id") == data.get("pane_id")),
             None,
@@ -761,6 +782,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"Trusted {selected_agent['project']} (always allow)")
         except Exception as e:
             await query.message.reply_text(f"Failed: {scrub(e)}")
+        return
+
+    if action in ("toggle", "submit"):
+        await handle_question_tap(query, data, selected_agent)
         return
 
     if action != "approval":
@@ -833,6 +858,34 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_question_tap(query, data: dict, agent: dict):
+    """Toggle one checkbox of a multi-select question, or submit it."""
+    pane_id = data["pane_id"]
+    if not data.get("g") or data["g"] != approval_tokens.get(pane_id):
+        await query.message.reply_text(
+            "That question has changed. Use the controls on the agent's latest card."
+        )
+        return
+    blocked = blocked_by_key.get(tg_chat.agent_key(agent)) or {}
+    prompt_id = blocked_prompt_ids.get(pane_id, "")
+    if data["action"] == "submit":
+        await deliver_choice(
+            query, pane_id, "Submit",
+            lambda: send_question_command_to_relay("question_submit", pane_id, prompt_id),
+        )
+        return
+    try:
+        option = (blocked.get("multi_options") or [])[int(data.get("i"))]
+    except (TypeError, ValueError, IndexError):
+        await query.message.reply_text("That option is no longer available. Use the agent's latest card.")
+        return
+    await deliver_choice(
+        query, pane_id, option,
+        lambda: send_question_command_to_relay("question_toggle", pane_id, prompt_id, option=option),
+        consume=False, confirm=False,
+    )
+
+
 # --- Free text reply ---
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -894,6 +947,50 @@ def numbered_button_label(number: int, option: str) -> str:
     return text
 
 
+def approval_generation(pane_id: str, prompt_id: str) -> str:
+    """Stable per question, so re-rendering a card does not change its buttons."""
+    return hashlib.sha256(f"{pane_id}\0{prompt_id}".encode()).hexdigest()[:8]
+
+
+def open_output_row(pane_id: str) -> tuple:
+    return (("Open output & reply", pane_callback_data("select_reply", pane_id)),)
+
+
+def to_markup(rows: tuple) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=data) for label, data in row] for row in rows
+    ])
+
+
+def toggle_label(option: str, selected: bool) -> str:
+    text = f"{'☑' if selected else '☐'} {option}"
+    if len(text) > NUMBERED_LABEL_MAX:
+        text = text[:NUMBERED_LABEL_MAX - 1] + "…"
+    return text
+
+
+def card_rows(pane_id: str, blocked: dict | None) -> tuple:
+    """The buttons a card carries, as plain (label, callback_data) rows."""
+    if not blocked or blocked.get("text_field"):
+        return (open_output_row(pane_id),)
+    generation = approval_generation(pane_id, blocked.get("prompt_id") or "")
+    multi_options = blocked.get("multi_options") or []
+    if blocked.get("multi") and multi_options:
+        selected = set(blocked.get("selected_options") or [])
+        rows = [
+            ((toggle_label(option, option in selected),
+              pane_callback_data("toggle", pane_id, g=generation, i=str(i))),)
+            for i, option in enumerate(multi_options)
+        ]
+        rows.append((("Submit", pane_callback_data("submit", pane_id, g=generation)),))
+        rows.append(open_output_row(pane_id))
+        return tuple(rows)
+    options = blocked.get("options") or []
+    if not options:
+        return (open_output_row(pane_id),)
+    return approval_rows(pane_id, options, generation, blocked.get("interaction"))
+
+
 def make_keyboard(
     pane_id: str,
     options: list[str] | None,
@@ -902,6 +999,10 @@ def make_keyboard(
 ) -> InlineKeyboardMarkup:
     if not options:
         return interaction_keyboard(pane_id)
+    return to_markup(approval_rows(pane_id, options, generation or secrets.token_hex(4), interaction))
+
+
+def approval_rows(pane_id: str, options: list[str], generation: str, interaction: str | None) -> tuple:
     if interaction == "omp_question":
         buttons = [(opt, opt) for opt in options]
     elif interaction == "numbered":
@@ -914,99 +1015,53 @@ def make_keyboard(
     else:
         buttons = [(opt.split(",")[0], opt) for opt in options]
 
-    generation = generation or secrets.token_hex(4)
     if interaction == "omp_question":
-        keyboard = [
-            [InlineKeyboardButton(label, callback_data=pane_callback_data(
-                "approval", pane_id, g=generation, i=str(i),
-            ))]
+        rows = [
+            ((label, pane_callback_data("approval", pane_id, g=generation, i=str(i))),)
             for i, (label, _resp) in enumerate(buttons)
         ]
-        keyboard.append([InlineKeyboardButton(
-            "Open output & reply",
-            callback_data=pane_callback_data("select_reply", pane_id),
-        )])
-        return InlineKeyboardMarkup(keyboard)
-
-    # Standard approval prompts require a real numeric key press.
-    keyboard = [
-        [InlineKeyboardButton(label, callback_data=pane_callback_data(
-            "approval", pane_id, g=generation, k=str(i + 1)))]
-        for i, (label, _resp) in enumerate(buttons)
-    ]
-    keyboard.append([InlineKeyboardButton(
-        "Open output & reply",
-        callback_data=pane_callback_data("select_reply", pane_id),
-    )])
-    return InlineKeyboardMarkup(keyboard)
+    else:
+        # Standard approval prompts require a real numeric key press.
+        rows = [
+            ((label, pane_callback_data("approval", pane_id, g=generation, k=str(i + 1))),)
+            for i, (label, _resp) in enumerate(buttons)
+        ]
+    rows.append(open_output_row(pane_id))
+    return tuple(rows)
 
 
 def interaction_keyboard(pane_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "Open output & reply",
-            callback_data=pane_callback_data("select_reply", pane_id),
-        )
-    ]])
+    return to_markup((open_output_row(pane_id),))
 
 
-async def notify_blocked(
-    app: Application,
-    pane_id: str,
-    agent: str,
-    project: str,
-    prompt: str,
-    options: list[str] | None,
-    prompt_id: str | None = None,
-    interaction: str | None = None,
-    multi: bool = False,
-):
+def record_blocked(msg: dict) -> None:
+    """Remember a pane's latest blocked message; its prompt_id is what the relay will demand."""
+    pane_id = msg.get("pane_id")
+    if not pane_id:
+        return
+    blocked_by_key[tg_chat.card_key(msg.get("host"), pane_id)] = msg
+    if msg.get("prompt_id"):
+        blocked_prompt_ids[pane_id] = msg["prompt_id"]
+    approval_tokens[pane_id] = approval_generation(pane_id, msg.get("prompt_id") or "")
+
+
+async def notify_blocked(app: Application, msg: dict):
     if not CHAT_ID:
         return
-    instruction = (
-        "Use the web terminal or manual terminal controls to select multiple options."
-        if multi
-        else "Use an approval button, open the output, or reply to this notification."
+    text = f"*{msg.get('agent', 'unknown')}* blocked in `{msg.get('project', '')}`\n\n```\n{msg.get('prompt', '')[:400]}\n```"
+    sent = await app.bot.send_message(
+        chat_id=int(CHAT_ID), text=text, parse_mode="Markdown",
+        reply_markup=to_markup(card_rows(msg["pane_id"], msg)),
     )
-    text = (
-        f"*{agent}* blocked in `{project}`\n\n```\n{prompt[:400]}\n```\n\n"
-        f"{instruction}"
-    )
-    generation = secrets.token_hex(4)
-    keyboard = make_keyboard(
-        pane_id,
-        [] if multi else options,
-        generation=generation,
-        interaction=interaction,
-    )
-    msg = await app.bot.send_message(
-        chat_id=int(CHAT_ID), text=text, parse_mode="Markdown", reply_markup=keyboard
-    )
-    approval_tokens[pane_id] = generation
-    if prompt_id:
-        blocked_prompt_ids[pane_id] = prompt_id
-    register_pending(int(CHAT_ID), msg.message_id, pane_id)
+    register_pending(int(CHAT_ID), sent.message_id, msg["pane_id"])
 
 
 async def notify_blocked_safely(app: Application, msg: dict):
+    record_blocked(msg)
     if msg.get("update"):
-        # Same blocked streak, re-hashed content: the prompt_id the relay will demand has
-        # moved, so keep ours current or every tap after the redraw fails as "prompt changed".
-        if msg.get("pane_id") in blocked_prompt_ids and msg.get("prompt_id"):
-            blocked_prompt_ids[msg["pane_id"]] = msg["prompt_id"]
         return
     try:
-        await notify_blocked(
-            app,
-            pane_id=msg["pane_id"],
-            agent=msg.get("agent", "unknown"),
-            project=msg.get("project", ""),
-            prompt=msg.get("prompt", ""),
-            options=msg.get("options"),
-            prompt_id=msg.get("prompt_id"),
-            interaction=msg.get("interaction"),
-            multi=bool(msg.get("multi")),
-        )
+        await notify_blocked(app, msg)
     except Exception as e:
         log.warning("Failed to send blocked notification: %s", scrub(e))
 

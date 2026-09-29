@@ -588,14 +588,10 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tg.approval_tokens, {})
         self.assertEqual(tg.blocked_prompt_ids, {})
 
-    async def test_failed_blocked_notification_preserves_previous_generation(self):
-        tg.approval_tokens["w0:p1"] = "previous"
-        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(side_effect=OSError("offline"))))
-
-        with self.assertRaisesRegex(OSError, "offline"):
-            await tg.notify_blocked(app, "w0:p1", "opencode", "project", "prompt", ["yes", "no"])
-
-        self.assertEqual(tg.approval_tokens["w0:p1"], "previous")
+    def test_approval_generation_is_stable_per_question(self):
+        self.assertEqual(tg.approval_generation("w0:p1", "q1"), tg.approval_generation("w0:p1", "q1"))
+        self.assertNotEqual(tg.approval_generation("w0:p1", "q1"), tg.approval_generation("w0:p1", "q2"))
+        self.assertNotEqual(tg.approval_generation("w0:p1", "q1"), tg.approval_generation("w1:p1", "q1"))
 
     async def test_blocked_notification_failure_does_not_disconnect_relay(self):
         tg.relay_connected = True
@@ -613,7 +609,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(tg.relay_connected)
         self.assertEqual(tg.agents[0]["pane_id"], "w0:p1")
-        self.assertEqual(tg.approval_tokens["w0:p1"], "previous")
+        self.assertEqual(tg.approval_tokens["w0:p1"], tg.approval_generation("w0:p1", ""))
 
     async def test_graceful_relay_close_clears_connection_state(self):
         tg.relay_connected = True
@@ -658,20 +654,18 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_blocked_notification_keeps_approvals_and_adds_interaction(self):
         bot = FakeBot()
-        await tg.notify_blocked(
-            SimpleNamespace(bot=bot),
-            pane_id="w0:p1",
-            agent="opencode",
-            project="blocked-project",
-            prompt="Allow tool?",
-            options=["yes, single permission", "trust, always allow", "no (tab to edit)"],
-        )
+        await tg.notify_blocked(SimpleNamespace(bot=bot), {
+            "pane_id": "w0:p1",
+            "agent": "opencode",
+            "project": "blocked-project",
+            "prompt": "Allow tool?",
+            "options": ["yes, single permission", "trust, always allow", "no (tab to edit)"],
+        })
 
         chat_id, text, kwargs, sent = bot.sent[0]
         rows = kwargs["reply_markup"].inline_keyboard
         self.assertEqual([json.loads(row[0].callback_data)["k"] for row in rows[:3]], ["1", "2", "3"])
         self.assertEqual(rows[-1][0].text, "Open output & reply")
-        self.assertIn("reply to this notification", text)
         self.assertEqual(tg.pending_pane(chat_id, sent.message_id), "w0:p1")
 
     async def test_group_prompts_keep_independent_pane_mappings(self):
@@ -921,8 +915,127 @@ class ApprovalDoubleTapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(tg.blocked_prompt_ids["w0:p1"], "new")
-        self.assertNotIn("w0:p2", tg.blocked_prompt_ids)  # never announced: nothing to refresh
+        self.assertEqual(tg.blocked_prompt_ids["w0:p2"], "x")
         self.assertEqual(app.bot.sent, [])
+
+
+
+MULTI = {
+    "type": "blocked", "pane_id": "w0:p1", "host": "local", "prompt": "Which?",
+    "prompt_id": "q1", "options": [], "multi": True, "interaction": "multi_question",
+    "multi_options": ["Color", "Font"], "selected_options": ["Font"],
+}
+
+
+def rows_text(rows):
+    return [label for row in rows for label, _data in row]
+
+
+class CardRowsTests(unittest.TestCase):
+    def setUp(self):
+        tg.agents = make_agents(1, status="blocked")
+
+    def test_plain_and_text_field_cards_only_open_output(self):
+        self.assertEqual(rows_text(tg.card_rows("w0:p1", None)), ["Open output & reply"])
+        typing = {**MULTI, "text_field": True}
+        self.assertEqual(rows_text(tg.card_rows("w0:p1", typing)), ["Open output & reply"])
+
+    def test_multi_select_rows_toggle_submit_and_open(self):
+        rows = tg.card_rows("w0:p1", MULTI)
+        self.assertEqual(rows_text(rows), ["☐ Color", "☑ Font", "Submit", "Open output & reply"])
+        toggle = tg.parse_callback_data(rows[1][0][1])
+        self.assertEqual((toggle["action"], toggle["i"], toggle["g"]),
+                         ("toggle", "1", tg.approval_generation("w0:p1", "q1")))
+        self.assertEqual(tg.parse_callback_data(rows[2][0][1])["action"], "submit")
+
+    def test_numbered_menu_rows_press_keys(self):
+        msg = {"pane_id": "w0:p1", "prompt_id": "q2", "options": ["Yes", "No"], "interaction": "numbered"}
+        rows = tg.card_rows("w0:p1", msg)
+        self.assertEqual(rows_text(rows), ["1. Yes", "2. No", "Open output & reply"])
+        self.assertEqual(json.loads(rows[1][0][1])["k"], "2")
+
+    def test_rows_are_stable_and_fit_callback_limit(self):
+        long = {**MULTI, "multi_options": ["x" * 80] * 12}
+        self.assertEqual(tg.card_rows("w0:p1", long), tg.card_rows("w0:p1", long))
+        for row in tg.card_rows("w0:p1", long):
+            for label, data in row:
+                self.assertLessEqual(len(data.encode()), 64)
+                self.assertLessEqual(len(label), tg.NUMBERED_LABEL_MAX)
+
+
+class MultiSelectTapTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.old_chat_id = tg.CHAT_ID
+        tg.CHAT_ID = "42"
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="blocked")
+        tg.approval_tokens.clear()
+        tg.blocked_prompt_ids.clear()
+        tg.blocked_by_key.clear()
+        tg.approval_in_flight.clear()
+        tg.record_blocked(MULTI)
+
+    def tearDown(self):
+        tg.CHAT_ID = self.old_chat_id
+
+    def _tap(self, row_index):
+        rows = tg.card_rows("w0:p1", MULTI)
+        callback = FakeCallback(rows[row_index][0][1])
+        callback.message.reply_markup = tg.to_markup(rows)
+        return callback
+
+    async def test_toggle_sends_option_and_keeps_question_open(self):
+        callback = self._tap(0)
+        with patch.object(tg, "send_question_command_to_relay", AsyncMock()) as send:
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        send.assert_awaited_once_with("question_toggle", "w0:p1", "q1", option="Color")
+        self.assertIn("w0:p1", tg.approval_tokens)
+        self.assertEqual(callback.message.replies, [])
+
+    async def test_failed_toggle_restores_buttons(self):
+        callback = self._tap(0)
+        with patch.object(tg, "send_question_command_to_relay", AsyncMock(side_effect=RuntimeError("question changed"))):
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        self.assertIs(callback.edited_markup, callback.message.reply_markup)
+        self.assertIn("Failed: question changed", callback.message.replies[0][0])
+
+    async def test_submit_consumes_question(self):
+        callback = self._tap(2)
+        with patch.object(tg, "send_question_command_to_relay", AsyncMock()) as send:
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        send.assert_awaited_once_with("question_submit", "w0:p1", "q1")
+        self.assertNotIn("w0:p1", tg.approval_tokens)
+        self.assertEqual(callback.message.replies[0][0], "Sent: Submit")
+
+    async def test_tap_from_an_older_question_is_refused(self):
+        callback = self._tap(0)
+        tg.record_blocked({**MULTI, "prompt_id": "q9"})
+        with patch.object(tg, "send_question_command_to_relay", AsyncMock()) as send:
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        send.assert_not_awaited()
+        self.assertIn("question has changed", callback.message.replies[0][0])
+
+    async def test_question_command_waits_for_matching_result(self):
+        accepted = FakeRelayConnection([
+            {"type": "agents", "agents": []},
+            {"type": "command_result", "command": "question_toggle", "ok": True, "request_id": "req-1"},
+        ])
+        with patch("websockets.connect", return_value=accepted), patch.object(
+            tg.secrets, "token_hex", return_value="req-1"
+        ):
+            await tg.send_question_command_to_relay("question_toggle", "w0:p1", "q1", option="Font")
+        self.assertEqual(accepted.sent, [{
+            "type": "question_toggle", "pane_id": "w0:p1", "prompt_id": "q1",
+            "request_id": "req-1", "option": "Font",
+        }])
+        rejected = FakeRelayConnection([
+            {"type": "command_result", "command": "question_submit", "ok": False, "request_id": "req-2"},
+        ])
+        with patch("websockets.connect", return_value=rejected), patch.object(
+            tg.secrets, "token_hex", return_value="req-2"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "rejected question_submit"):
+                await tg.send_question_command_to_relay("question_submit", "w0:p1", "q1")
 
 
 if __name__ == "__main__":

@@ -33,6 +33,23 @@ def _telegram_stubs():
     telegram.InlineKeyboardButton = InlineKeyboardButton
     telegram.InlineKeyboardMarkup = InlineKeyboardMarkup
 
+    error = types.ModuleType("telegram.error")
+
+    class NetworkError(Exception):
+        pass
+
+    class BadRequest(NetworkError):
+        pass
+
+    class RetryAfter(Exception):
+        def __init__(self, retry_after):
+            super().__init__(f"retry after {retry_after}")
+            self.retry_after = retry_after
+
+    error.NetworkError = NetworkError
+    error.BadRequest = BadRequest
+    error.RetryAfter = RetryAfter
+
     ext = types.ModuleType("telegram.ext")
     ext.Application = object
     ext.CallbackQueryHandler = object
@@ -40,7 +57,7 @@ def _telegram_stubs():
     ext.ContextTypes = types.SimpleNamespace(DEFAULT_TYPE=object)
     ext.MessageHandler = object
     ext.filters = types.SimpleNamespace()
-    return {"telegram": telegram, "telegram.ext": ext}
+    return {"telegram": telegram, "telegram.error": error, "telegram.ext": ext}
 
 
 def loaded_telegram():
@@ -65,30 +82,32 @@ class _Bot:
 
 
 class TelegramQuestionTests(unittest.TestCase):
-    def test_multi_select_notification_only_offers_safe_output_link(self):
+    def test_multi_select_notification_offers_toggles_and_submit(self):
         telegram = loaded_telegram()
         telegram.CHAT_ID = "1"
         bot = _Bot()
         app = types.SimpleNamespace(bot=bot)
 
         asyncio.run(
-            telegram.notify_blocked(
-                app,
-                pane_id="pane-1",
-                agent="omp",
-                project="demo",
-                prompt="Which capabilities?",
-                options=["Color", "Font"],
-                multi=True,
-            )
+            telegram.notify_blocked(app, {
+                "pane_id": "pane-1",
+                "agent": "omp",
+                "project": "demo",
+                "prompt": "Which capabilities?",
+                "prompt_id": "q1",
+                "options": [],
+                "multi": True,
+                "interaction": "omp_question",
+                "multi_options": ["Color", "Font"],
+                "selected_options": [],
+            })
         )
 
         markup = bot.sent[0]["reply_markup"]
         self.assertEqual(
             [button.text for row in markup.inline_keyboard for button in row],
-            ["Open output & reply"],
+            ["☐ Color", "☐ Font", "Submit", "Open output & reply"],
         )
-        self.assertIn("web terminal or manual terminal controls", bot.sent[0]["text"])
         self.assertEqual(telegram.pending[(1, 42)], "pane-1")
 
 
