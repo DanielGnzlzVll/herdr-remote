@@ -1172,5 +1172,92 @@ class ChatWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tg.chat_wake.is_set())
 
 
+
+class TransientMessageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.old_chat_id = tg.CHAT_ID
+        self.old_store = tg.chat_store
+        self.tmp = tempfile.TemporaryDirectory()
+        tg.CHAT_ID = "42"
+        tg.chat_store = tg_chat.ChatStore(os.path.join(self.tmp.name, "chat.json"))
+        tg.chat_state = tg_chat.ChatState()
+        tg.relay_connected = True
+        tg.agents = make_agents(1)
+        tg.pending.clear()
+
+    def tearDown(self):
+        tg.CHAT_ID = self.old_chat_id
+        tg.chat_store = self.old_store
+        self.tmp.cleanup()
+
+    def transient(self, message_id):
+        return tg.chat_state.transients[message_id]
+
+    async def test_confirmation_is_ephemeral(self):
+        tg.relay_connected = False
+        callback = FakeCallback({"action": "select_reply", "pane_id": "w0:p1"})
+        before = tg.time.time()
+        await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+
+        sent = callback.message.replies[0][2]
+        record = self.transient(sent.message_id)
+        self.assertEqual(record.kind, "ephemeral")
+        self.assertGreaterEqual(record.deadline, before + tg.EPHEMERAL_TTL)
+
+    async def test_command_and_its_output_share_a_lifetime_and_rerun_supersedes(self):
+        first = make_update(message=FakeMessage(message_id=10))
+        await tg.cmd_status(first, make_context())
+        reply = first.message.replies[0][2].message_id
+        self.assertEqual((self.transient(10).kind, self.transient(10).owner), ("command", "status"))
+        self.assertEqual(self.transient(reply).owner, "status")
+
+        second = make_update(message=FakeMessage(message_id=11))
+        with patch.object(tg.time, "time", return_value=5000.0):
+            await tg.cmd_status(second, make_context())
+        self.assertEqual(self.transient(10).deadline, 5000.0)
+        self.assertEqual(self.transient(reply).deadline, 5000.0)
+        self.assertGreater(self.transient(11).deadline, 5000.0)
+
+    async def test_reply_prompt_is_linked_to_its_agent(self):
+        callback = FakeCallback({"action": "select_reply", "pane_id": "w0:p1"})
+        with patch.object(tg, "read_pane", AsyncMock(return_value="output")):
+            await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        sent = callback.message.replies[0][2]
+        self.assertEqual((self.transient(sent.message_id).kind, self.transient(sent.message_id).owner),
+                         ("linked", "local|w0:p1"))
+
+    async def test_any_incoming_message_is_recorded_before_handling(self):
+        message = FakeMessage(message_id=55)
+        await tg.record_incoming(SimpleNamespace(effective_message=message), make_context())
+        self.assertEqual(self.transient(55).kind, "ephemeral")
+        self.assertEqual(tg.chat_state.high_water, 55)
+
+    async def test_messages_from_other_chats_are_not_tracked(self):
+        await tg.record_incoming(SimpleNamespace(effective_message=FakeMessage(chat_id=7, message_id=56)),
+                                 make_context())
+        self.assertEqual(tg.chat_state.transients, {})
+
+    async def test_expired_ephemeral_is_deleted_by_the_next_pass(self):
+        sent = await tg.reply_ephemeral(FakeMessage(), "Sent")
+        bot = ChatBot()
+        tg.agents = []
+        with patch.object(tg.time, "time", return_value=tg.time.time() + tg.EPHEMERAL_TTL + 1):
+            await tg.reconcile_once(bot, 0.0)
+        self.assertIn(sent.message_id, bot.deleted)
+        self.assertNotIn(sent.message_id, tg.chat_state.transients)
+
+    def test_every_reply_goes_through_a_lifetime_helper(self):
+        tree = ast.parse((ROOT / "relay" / "herdr_telegram.py").read_text(encoding="utf-8"))
+        allowed = {"reply_ephemeral", "reply_command", "show_pane_view", "send_reply_prompt", "send_card"}
+        offenders = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or fn.name in allowed:
+                continue
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Attribute) and node.attr in ("reply_text", "send_message"):
+                    offenders.append(f"{fn.name}:{node.lineno}")
+        self.assertEqual(offenders, [], "untracked messages would never be cleaned up")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -219,6 +219,38 @@ def pending_pane(chat_id: int, message_id: int) -> str | None:
     return pending.get((int(chat_id), int(message_id)))
 
 
+def remember(message, kind: str, owner: str = "", supersede: bool = False) -> None:
+    """Record a non-card message so the reconciler keeps it exactly as long as its class allows."""
+    if not CHAT_ID or message is None or str(getattr(message, "chat_id", "")) != CHAT_ID:
+        return
+    now = time.time()
+    deadline = {"ephemeral": now + EPHEMERAL_TTL, "command": now + COMMAND_TTL}.get(kind)
+    tg_chat.record_transient(chat_state, message.message_id, kind, owner, deadline, now, supersede)
+    chat_wake.set()
+
+
+async def reply_ephemeral(message, text: str, **kwargs):
+    sent = await message.reply_text(text, **kwargs)
+    remember(sent, "ephemeral")
+    return sent
+
+
+async def reply_command(message, command: str, text: str, **kwargs):
+    sent = await message.reply_text(text, **kwargs)
+    remember(sent, "command", command)
+    return sent
+
+
+def pane_key(pane_id: str) -> str:
+    agent = find_agent(pane_id)
+    return tg_chat.agent_key(agent) if agent else tg_chat.card_key(None, pane_id)
+
+
+async def record_incoming(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Every incoming message starts as ephemeral; command handlers upgrade their own."""
+    remember(update.effective_message, "ephemeral")
+
+
 READ_VIEW_MAX = 3500
 
 
@@ -266,6 +298,7 @@ async def show_pane_view(bot, chat_id: int, message, pane_id: str, header: str, 
     sent = await message.reply_text(text, parse_mode="MarkdownV2")
     read_views[key] = sent.message_id
     register_pending(chat_id, sent.message_id, pane_id)
+    remember(sent, "linked", pane_key(pane_id))
     return sent.message_id
 
 
@@ -299,6 +332,7 @@ async def send_reply_prompt(message, chat, agent: dict, content: str | None = No
         )
     sent = await message.reply_text("\n".join(parts), **kwargs)
     register_pending(chat.id, sent.message_id, agent["pane_id"])
+    remember(sent, "linked", tg_chat.agent_key(agent))
     return sent
 
 
@@ -457,21 +491,23 @@ def dashboard_text() -> str:
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
+    remember(update.message, "command", "start", supersede=True)
     if not authorized(update):
         return
     text = dashboard_text()
     if not CHAT_ID:
         text = text.format(chat_id=update.effective_chat.id)
     if relay_connected and agents:
-        await update.message.reply_text(text, reply_markup=build_agent_keyboard("select_reply"))
+        await reply_command(update.message, "start", text, reply_markup=build_agent_keyboard("select_reply"))
         return
-    await update.message.reply_text(text)
+    await reply_command(update.message, "start", text)
 
 
 async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /agents — list current agents with status."""
+    remember(update.message, "command", "agents", supersede=True)
     if not agents:
-        await update.message.reply_text("No agents connected." if relay_connected else "Not connected to relay.")
+        await reply_command(update.message, "agents", "No agents connected." if relay_connected else "Not connected to relay.")
         return
 
     blocked = [a for a in agents if a.get("status") == "blocked"]
@@ -501,11 +537,12 @@ async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
             lines.append(f"  {a['project']} ({a['agent']}){host}")
 
-    await update.message.reply_text("\n".join(lines))
+    await reply_command(update.message, "agents", "\n".join(lines))
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /status — show connection info."""
+    remember(update.message, "command", "status", supersede=True)
     b = len([a for a in agents if a.get("status") == "blocked"])
     w = len([a for a in agents if a.get("status") == "working"])
     d = len([a for a in agents if a.get("status") == "done"])
@@ -517,25 +554,26 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Status: {status}\n"
         f"Agents: {len(agents)} ({b} blocked, {w} working, {d} done, {i} idle)"
     )
-    await update.message.reply_text(text)
+    await reply_command(update.message, "status", text)
 
 
 async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /read [project] — read pane output."""
+    remember(update.message, "command", "read", supersede=True)
     args = ctx.args
     if not args:
         # Show agent picker
         if not agents:
-            await update.message.reply_text("No agents. Use /agents to check.")
+            await reply_ephemeral(update.message, "No agents. Use /agents to check.")
             return
-        await update.message.reply_text("Read which agent?", reply_markup=build_agent_keyboard("read"))
+        await reply_command(update.message, "read", "Read which agent?", reply_markup=build_agent_keyboard("read"))
         return
 
     # Find agent by project name
     query = " ".join(args).lower()
     match = next((a for a in agents if query in a.get("project", "").lower() or query in a.get("agent", "").lower()), None)
     if not match:
-        await update.message.reply_text(f"No agent matching '{query}'. Use /agents to see list.")
+        await reply_ephemeral(update.message, f"No agent matching '{query}'. Use /agents to see list.")
         return
 
     content = await read_pane(match["pane_id"])
@@ -545,16 +583,17 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_interrupt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /interrupt [project] — send Ctrl+C."""
+    remember(update.message, "command", "interrupt", supersede=True)
     args = ctx.args
     if not args:
         if not agents:
-            await update.message.reply_text("No agents.")
+            await reply_ephemeral(update.message, "No agents.")
             return
         working = [a for a in agents if a.get("status") in ("working", "blocked")]
         if not working:
-            await update.message.reply_text("No active agents to interrupt.")
+            await reply_ephemeral(update.message, "No active agents to interrupt.")
             return
-        await update.message.reply_text(
+        await reply_command(update.message, "interrupt",
             "Interrupt which agent?",
             reply_markup=build_agent_keyboard("interrupt", agent_list=working),
         )
@@ -563,24 +602,25 @@ async def cmd_interrupt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = " ".join(args).lower()
     match = next((a for a in agents if query in a.get("project", "").lower() or query in a.get("agent", "").lower()), None)
     if not match:
-        await update.message.reply_text(f"No agent matching '{query}'.")
+        await reply_ephemeral(update.message, f"No agent matching '{query}'.")
         return
 
     try:
         await send_keys_to_relay(match["pane_id"], ["C-c"])
-        await update.message.reply_text(f"Sent Ctrl+C to {match['project']}")
+        await reply_ephemeral(update.message, f"Sent Ctrl+C to {match['project']}")
     except Exception as e:
-        await update.message.reply_text(f"Failed: {scrub(e)}")
+        await reply_ephemeral(update.message, f"Failed: {scrub(e)}")
 
 
 async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /send [project] [text] — send text + Enter to a pane."""
+    remember(update.message, "command", "send", supersede=True)
     args = ctx.args
     if not args:
         if not agents:
-            await update.message.reply_text("No agents.")
+            await reply_ephemeral(update.message, "No agents.")
             return
-        await update.message.reply_text(
+        await reply_command(update.message, "send",
             "Send to which agent?\n(After selecting, reply with your text)",
             reply_markup=build_agent_keyboard("select_send"),
         )
@@ -589,7 +629,7 @@ async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = args[0].lower()
     match = next((a for a in agents if query in a.get("project", "").lower() or query in a.get("agent", "").lower()), None)
     if not match:
-        await update.message.reply_text(f"No agent matching '{query}'. Use /agents to see list.")
+        await reply_ephemeral(update.message, f"No agent matching '{query}'. Use /agents to see list.")
         return
 
     text = " ".join(args[1:])
@@ -599,27 +639,28 @@ async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         await send_text_to_relay(match["pane_id"], text)
-        await update.message.reply_text(f"Sent to {match['project']}: {text}")
+        await reply_ephemeral(update.message, f"Sent to {match['project']}: {text}")
     except Exception as e:
-        await update.message.reply_text(f"Failed: {scrub(e)}")
+        await reply_ephemeral(update.message, f"Failed: {scrub(e)}")
 
 
 async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /reply [project] — show agent output then accept input."""
+    remember(update.message, "command", "reply", supersede=True)
     args = ctx.args
 
     if not agents:
-        await update.message.reply_text("No agents.")
+        await reply_ephemeral(update.message, "No agents.")
         return
 
     if not args:
-        await update.message.reply_text("Reply to which agent?", reply_markup=build_agent_keyboard("select_reply"))
+        await reply_command(update.message, "reply", "Reply to which agent?", reply_markup=build_agent_keyboard("select_reply"))
         return
 
     query = " ".join(args).lower()
     match = next((a for a in agents if query in a.get("project", "").lower() or query in a.get("agent", "").lower()), None)
     if not match:
-        await update.message.reply_text(f"No agent matching '{query}'.")
+        await reply_ephemeral(update.message, f"No agent matching '{query}'.")
         return
 
     content = await read_pane(match["pane_id"])
@@ -630,15 +671,16 @@ async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_trust(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /trust [project] — send 'trust, always allow' to a blocked agent."""
+    remember(update.message, "command", "trust", supersede=True)
     args = ctx.args
     blocked = [a for a in agents if a.get("status") == "blocked"]
 
     if not blocked:
-        await update.message.reply_text("No blocked agents.")
+        await reply_ephemeral(update.message, "No blocked agents.")
         return
 
     if not args:
-        await update.message.reply_text(
+        await reply_command(update.message, "trust",
             "Trust which agent?",
             reply_markup=build_agent_keyboard("trust", agent_list=blocked),
         )
@@ -647,7 +689,7 @@ async def cmd_trust(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = " ".join(args).lower()
     match = next((a for a in blocked if query in a.get("project", "").lower() or query in a.get("agent", "").lower()), None)
     if not match:
-        await update.message.reply_text(f"No blocked agent matching '{query}'.")
+        await reply_ephemeral(update.message, f"No blocked agent matching '{query}'.")
         return
 
     try:
@@ -656,15 +698,16 @@ async def cmd_trust(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "trust, always allow",
             prompt_id=blocked_prompt_ids.get(match["pane_id"]),
         )
-        await update.message.reply_text(f"Trusted {match['project']} (always allow)")
+        await reply_ephemeral(update.message, f"Trusted {match['project']} (always allow)")
     except Exception as e:
-        await update.message.reply_text(f"Failed: {scrub(e)}")
+        await reply_ephemeral(update.message, f"Failed: {scrub(e)}")
 
 
 async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /digest — show today's agent activity summary."""
+    remember(update.message, "command", "digest", supersede=True)
     if not daily_stats:
-        await update.message.reply_text("No activity recorded yet today.")
+        await reply_command(update.message, "digest", "No activity recorded yet today.")
         return
 
     import time
@@ -676,7 +719,7 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         time_str = f"{mins}m" if mins < 60 else f"{mins//60}h{mins%60}m"
         lines.append(f"  {s['project']} ({s['agent']}): {time_str} working{blocked}")
 
-    await update.message.reply_text("\n".join(lines))
+    await reply_command(update.message, "digest", "\n".join(lines))
 
 
 # --- Callback handler (buttons) ---
@@ -695,7 +738,7 @@ async def deliver_choice(query, pane_id: str, label: str, deliver, consume: bool
     confirm=False (the card's redrawn checkbox is the confirmation).
     """
     if pane_id in approval_in_flight:
-        await query.message.reply_text(
+        await reply_ephemeral(query.message,
             f"Still sending your previous choice -- wait for \"Sent\" before tapping again."
         )
         return False
@@ -714,12 +757,12 @@ async def deliver_choice(query, pane_id: str, label: str, deliver, consume: bool
             await query.edit_message_reply_markup(reply_markup=previous_markup)
         except Exception:
             pass
-        await query.message.reply_text(f"Failed: {scrub(e)}")
+        await reply_ephemeral(query.message, f"Failed: {scrub(e)}")
         return False
     finally:
         approval_in_flight.discard(pane_id)
     if confirm:
-        await query.message.reply_text(f"Sent: {label}")
+        await reply_ephemeral(query.message, f"Sent: {label}")
     return True
 
 
@@ -732,7 +775,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if not relay_connected:
-        await query.message.reply_text("Relay disconnected. Use /start after it reconnects.")
+        await reply_ephemeral(query.message, "Relay disconnected. Use /start after it reconnects.")
         return
 
     data = parse_callback_data(query.data)
@@ -741,7 +784,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "page":
         menu = data.get("menu", "select_reply")
         if not agents_for_action(menu):
-            await query.message.reply_text("No eligible agents are available.")
+            await reply_ephemeral(query.message, "No eligible agents are available.")
             return
         await query.edit_message_reply_markup(
             reply_markup=build_agent_keyboard(menu, page=data.get("page", 0))
@@ -756,7 +799,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             None,
         )
         if selected_agent is None:
-            await query.message.reply_text(
+            await reply_ephemeral(query.message,
                 "That agent is no longer available for this action. Refresh the list and choose another agent.",
                 reply_markup=refresh_keyboard(eligible_action),
             )
@@ -771,9 +814,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "interrupt":
         try:
             await send_keys_to_relay(data["pane_id"], ["C-c"])
-            await query.message.reply_text("Sent Ctrl+C")
+            await reply_ephemeral(query.message, "Sent Ctrl+C")
         except Exception as e:
-            await query.message.reply_text(f"Failed: {scrub(e)}")
+            await reply_ephemeral(query.message, f"Failed: {scrub(e)}")
         return
 
     if action == "select_send":
@@ -794,9 +837,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "trust, always allow",
                 prompt_id=blocked_prompt_ids.get(data["pane_id"]),
             )
-            await query.message.reply_text(f"Trusted {selected_agent['project']} (always allow)")
+            await reply_ephemeral(query.message, f"Trusted {selected_agent['project']} (always allow)")
         except Exception as e:
-            await query.message.reply_text(f"Failed: {scrub(e)}")
+            await reply_ephemeral(query.message, f"Failed: {scrub(e)}")
         return
 
     if action in ("toggle", "submit"):
@@ -804,19 +847,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action != "approval":
-        await query.message.reply_text("That action is no longer valid. Refresh the list and try again.")
+        await reply_ephemeral(query.message, "That action is no longer valid. Refresh the list and try again.")
         return
 
     pane_id = data["pane_id"]
     if not data.get("g") or data["g"] != approval_tokens.get(pane_id):
-        await query.message.reply_text(
+        await reply_ephemeral(query.message,
             "That approval belongs to an older prompt. Use the controls on the latest blocked notification."
         )
         return
 
     prompt_id = blocked_prompt_ids.get(pane_id)
     if not prompt_id:
-        await query.message.reply_text(
+        await reply_ephemeral(query.message,
             "That approval belongs to an older prompt. Use the controls on the latest blocked notification."
         )
         return
@@ -826,7 +869,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             option_index = int(option_index)
         except (TypeError, ValueError):
-            await query.message.reply_text("That approval action is no longer supported. Use the latest notification.")
+            await reply_ephemeral(query.message, "That approval action is no longer supported. Use the latest notification.")
             return
         label = None
         if query.message and query.message.reply_markup:
@@ -842,7 +885,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if label is not None:
                     break
         if not label:
-            await query.message.reply_text("That approval action is no longer supported. Use the latest notification.")
+            await reply_ephemeral(query.message, "That approval action is no longer supported. Use the latest notification.")
             return
         await deliver_choice(
             query, pane_id, label, lambda: send_to_relay(pane_id, label, prompt_id=prompt_id)
@@ -855,7 +898,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # not as Enter, so the prompt never gets confirmed. A real key press does.
     key = data.get("k")
     if key is None:
-        await query.message.reply_text("That approval action is no longer supported. Use the latest notification.")
+        await reply_ephemeral(query.message, "That approval action is no longer supported. Use the latest notification.")
         return
     # Recover the pressed button's label for the confirmation (kept out of
     # callback_data to respect Telegram's 64-byte limit).
@@ -877,7 +920,7 @@ async def handle_question_tap(query, data: dict, agent: dict):
     """Toggle one checkbox of a multi-select question, or submit it."""
     pane_id = data["pane_id"]
     if not data.get("g") or data["g"] != approval_tokens.get(pane_id):
-        await query.message.reply_text(
+        await reply_ephemeral(query.message,
             "That question has changed. Use the controls on the agent's latest card."
         )
         return
@@ -892,7 +935,7 @@ async def handle_question_tap(query, data: dict, agent: dict):
     try:
         option = (blocked.get("multi_options") or [])[int(data.get("i"))]
     except (TypeError, ValueError, IndexError):
-        await query.message.reply_text("That option is no longer available. Use the agent's latest card.")
+        await reply_ephemeral(query.message, "That option is no longer available. Use the agent's latest card.")
         return
     await deliver_choice(
         query, pane_id, option,
@@ -911,10 +954,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not pane_id:
         return
     if not relay_connected:
-        await update.message.reply_text("Relay disconnected. Use /start after it reconnects.")
+        await reply_ephemeral(update.message, "Relay disconnected. Use /start after it reconnects.")
         return
     if find_agent(pane_id) is None:
-        await update.message.reply_text(
+        await reply_ephemeral(update.message,
             "That agent is no longer available. Refresh the list and choose another agent.",
             reply_markup=refresh_keyboard("select_reply"),
         )
@@ -926,9 +969,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await send_to_relay(pane_id, update.message.text, prompt_id=prompt_id)
         else:
             await send_text_to_relay(pane_id, update.message.text)
-        await update.message.reply_text("Sent")
+        await reply_ephemeral(update.message, "Sent")
     except Exception as e:
-        await update.message.reply_text(f"Failed: {scrub(e)}")
+        await reply_ephemeral(update.message, f"Failed: {scrub(e)}")
 
 
 # --- Blocked notification ---
@@ -1282,6 +1325,7 @@ def main():
     else:
         auth_filter = filters.ALL  # No restriction in discovery mode
 
+    app.add_handler(MessageHandler(auth_filter, record_incoming), group=-1)
     app.add_handler(CommandHandler("start", cmd_start, filters=auth_filter))
     app.add_handler(CommandHandler("agents", cmd_agents, filters=auth_filter))
     app.add_handler(CommandHandler("status", cmd_status, filters=auth_filter))
