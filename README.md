@@ -127,7 +127,16 @@ uv run relay/herdr_telegram.py
 
 The `/start`, `/read`, `/reply`, `/send`, `/interrupt`, and `/trust` pickers keep every eligible agent reachable. Normal herds appear in one list; larger herds include Previous and Next buttons. Selecting an agent opens a reply prompt containing its recent output; reply to that prompt to send text safely to the pane.
 
-Finished and blocked notifications include **Open output & reply**. You can also reply directly to the notification to send a follow-up without returning to the agent list. Blocked notifications retain their one-tap approval controls.
+The chat mirrors the herd: each live agent has one card showing its tab, project, harness, current activity and status, plus its last message when done or its question when blocked. A card is edited in place as the agent changes, reposted (with a notification) when the agent blocks or finishes, and deleted once the agent has been gone for `HERDR_TG_CLOSE_GRACE` seconds. Reply to a card to send a follow-up; blocked cards carry the approval buttons, and multi-select questions carry a toggle per option plus **Submit**. Confirmations disappear after `HERDR_TG_EPHEMERAL_TTL` seconds and command output after `HERDR_TG_COMMAND_TTL`.
+
+The bot converges the chat to this state after any outage and deletes messages it does not account for, including history from older versions. Telegram does not let bots delete messages older than 48 hours, so older history has to be cleared once with *Clear history*.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HERDR_TG_CLOSE_GRACE` | `20` | Seconds an agent must be gone (while the relay is connected) before its card is deleted |
+| `HERDR_TG_EPHEMERAL_TTL` | `10` | Seconds a confirmation stays |
+| `HERDR_TG_COMMAND_TTL` | `600` | Seconds command output stays |
+| `HERDR_TG_STATE` | `$HERDR_LOG_DIR/telegram_chat.json` | Where the bot records which messages it owns |
 
 ## Architecture
 

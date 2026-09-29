@@ -107,6 +107,8 @@ cd herdi-win && ./build.ps1
 | `HERDR_REMOTE_CLAUDE_ROOTS` | Same, as remote shell words (default `$HOME/.claude/projects`) |
 | `HERDR_TRANSCRIPT_MAX_BYTES` / `HERDR_TRANSCRIPT_TAIL_BYTES` | Read only the last N bytes of a transcript past this size (default 64MB / 8MB) |
 | `HERDR_TRANSCRIPT_REMOTE_TAIL_BYTES` | Bytes of a remote transcript to fetch per read (default 4MB) |
+| `HERDR_TG_CLOSE_GRACE` / `HERDR_TG_EPHEMERAL_TTL` / `HERDR_TG_COMMAND_TTL` | Telegram bot: seconds before a gone agent's card, a confirmation, and command output are deleted (defaults 20 / 10 / 600) |
+| `HERDR_TG_STATE` | Telegram bot state file recording the messages it owns (default `$HERDR_LOG_DIR/telegram_chat.json`) |
 | `HERDI_RENDER` | Windows client only: `hardware` restores WPF's GPU path (default is software — see `herdi-win/README.md#memory`) |
 
 Runtime session overrides (per source) are persisted to `active_sessions.json` inside `HERDR_LOG_DIR`, so they survive relay restarts.
